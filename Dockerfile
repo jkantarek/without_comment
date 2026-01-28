@@ -17,7 +17,9 @@ COPY . .
 RUN playwright install firefox
 
 # Create a data directory for the SQLite database
-RUN mkdir -p /data
+# We set 777 permissions to ensure the app can write WAL/SHM files
+# regardless of host mount UID/GID mapping.
+RUN mkdir -p /data && chmod 777 /data
 ENV DB_PATH=/data/cache.db
 
 # Expose port
