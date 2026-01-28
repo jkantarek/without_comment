@@ -1,0 +1,15 @@
+searxng_url: "http://10.0.0.139:8080/"
+
+# Global ignore list applied to all feeds
+ignore_domains:
+  - "example.com"
+  - "ads.google.com"
+
+feeds:
+  # Object format with specific ignores
+  - url: "https://news.ycombinator.com/rss"
+    ignore_domains:
+      - "ycombinator.com" # Example: Don't show internal HN links
+
+  # You can also add simple strings:
+  # - "http://feeds.bbci.co.uk/news/rss.xml"

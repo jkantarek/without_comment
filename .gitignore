@@ -1,0 +1,17 @@
+# UV / Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Project specific
+cache.db
+cache.db-journal
+deps/
+temp_mcp_searxng/
+
+# Environment
+.env
+
+# System
+.DS_Store

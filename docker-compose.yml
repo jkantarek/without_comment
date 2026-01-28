@@ -1,0 +1,14 @@
+services:
+  aggregator:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/data
+    environment:
+      - ADMIN_USER=${ADMIN_USER:-admin}
+      - ADMIN_PASS=${ADMIN_PASS:-password}
+      - FEED_USER=${FEED_USER}
+      - FEED_PASS=${FEED_PASS}
+      - DB_PATH=/data/cache.db
+    restart: unless-stopped
