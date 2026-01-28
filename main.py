@@ -104,10 +104,18 @@ def get_feed_user(credentials: Optional[HTTPBasicCredentials] = Depends(HTTPBasi
 class FeedCache:
     def __init__(self, db_path):
         self.db_path = db_path
+        self.timeout = 30.0
         self._init_db()
 
+    def _get_conn(self):
+        conn = sqlite3.connect(self.db_path, timeout=self.timeout)
+        # Enable WAL mode for better concurrency
+        conn.execute("PRAGMA journal_mode=WAL")
+        return conn
+
     def _init_db(self):
-        with sqlite3.connect(self.db_path) as conn:
+        with self._get_conn() as conn:
+            # Articles table
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS articles (
                     guid TEXT PRIMARY KEY,
@@ -126,12 +134,15 @@ class FeedCache:
             except sqlite3.OperationalError:
                 # Column already exists
                 pass
+
+            # Feeds table
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS feeds (
                     url TEXT PRIMARY KEY,
                     ignore_domains TEXT
                 )
             """)
+            # Global Ignores table
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS global_ignores (
                     domain TEXT PRIMARY KEY
@@ -140,13 +151,13 @@ class FeedCache:
             conn.commit()
 
     def get_article(self, guid):
-        with sqlite3.connect(self.db_path) as conn:
+        with self._get_conn() as conn:
             cursor = conn.execute("SELECT * FROM articles WHERE guid = ?", (guid,))
             return cursor.fetchone()
 
     def save_article(self, guid, link, title, description, pub_date, source_title=None, hydrated=0):
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._get_conn() as conn:
                 conn.execute("""
                     INSERT OR REPLACE INTO articles (guid, link, title, description, source_title, pub_date, hydrated)
                     VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -156,46 +167,46 @@ class FeedCache:
             logger.error(f"DB Error: {e}")
 
     def get_latest_hydrated(self, limit=30):
-        with sqlite3.connect(self.db_path) as conn:
+        with self._get_conn() as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.execute("SELECT * FROM articles WHERE hydrated = 1 ORDER BY pub_date DESC LIMIT ?", (limit,))
             return [dict(row) for row in cursor.fetchall()]
 
     def get_unhydrated(self, limit=50):
-        with sqlite3.connect(self.db_path) as conn:
+        with self._get_conn() as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.execute("SELECT * FROM articles WHERE hydrated = 0 ORDER BY pub_date DESC LIMIT ?", (limit,))
             return [dict(row) for row in cursor.fetchall()]
 
     def add_feed(self, url, ignore_domains: List[str] = None):
-        with sqlite3.connect(self.db_path) as conn:
+        with self._get_conn() as conn:
             conn.execute("INSERT OR REPLACE INTO feeds (url, ignore_domains) VALUES (?, ?)", 
                         (url, json.dumps(ignore_domains or [])))
             conn.commit()
 
     def delete_feed(self, url):
-        with sqlite3.connect(self.db_path) as conn:
+        with self._get_conn() as conn:
             conn.execute("DELETE FROM feeds WHERE url = ?", (url,))
             conn.commit()
 
     def get_feeds(self):
-        with sqlite3.connect(self.db_path) as conn:
+        with self._get_conn() as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.execute("SELECT * FROM feeds")
             return [dict(row) for row in cursor.fetchall()]
 
     def add_global_ignore(self, domain):
-        with sqlite3.connect(self.db_path) as conn:
+        with self._get_conn() as conn:
             conn.execute("INSERT OR IGNORE INTO global_ignores (domain) VALUES (?)", (domain,))
             conn.commit()
 
     def delete_global_ignore(self, domain):
-        with sqlite3.connect(self.db_path) as conn:
+        with self._get_conn() as conn:
             conn.execute("DELETE FROM global_ignores WHERE domain = ?", (domain,))
             conn.commit()
 
     def get_global_ignores(self) -> List[str]:
-        with sqlite3.connect(self.db_path) as conn:
+        with self._get_conn() as conn:
             cursor = conn.execute("SELECT domain FROM global_ignores")
             return [row[0] for row in cursor.fetchall()]
 
