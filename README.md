@@ -1,12 +1,12 @@
 # without_comment
 
-A high-quality, automated RSS aggregator that hydrates summaries into full-text articles using Headless Firefox (Playwright) and the Mozilla Reader Mode algorithm.
+A probably garbage, AI vibed, automated RSS aggregator. It's supposed to hydrate summaries into full-text articles using Headless Firefox (Playwright) and the Mozilla Reader Mode algorithm.
 
 ## Features
 
-- **Unified Feed**: Aggregates multiple RSS sources into a single, clean RSS feed.
-- **Background Hydration**: Periodically fetches new articles and uses a headless browser to extract the primary content (preserving headers, images, and links).
-- **Intelligent Extraction**:
+- **Unified Feed**: Aggregates multiple RSS sources into a single, RSS feed.
+- **Background Hydration**: Periodically fetches new articles and uses a headless browser to extract the primary content (preserving headers, images, and links kinda sorta but not perfectly).
+- **Slop-sourced Extraction**:
   - Automatically triggers lazy-loading images via simulated scrolling.
   - Converts relative URLs to absolute paths.
   - Special handlers for Git repositories (GitHub, GitLab, Codeberg, Bitbucket) to extract READMEs.
@@ -40,9 +40,5 @@ ADMIN_USER=admin ADMIN_PASS=password ./run.sh
 docker-compose up -d
 ```
 
-## Endpoints
-
-- `GET /rss`: The unified, hydrated RSS feed.
-- `GET /admin`: The management dashboard (requires auth).
-- `GET /feeds`: List configured feeds (requires auth).
-- `POST /feeds`: Add a new feed (requires auth).
+/rss to see the feed
+/admin to see a barely workable same as it ever was UI to manage your feeds.
