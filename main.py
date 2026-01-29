@@ -109,8 +109,13 @@ class FeedCache:
 
     def _get_conn(self):
         conn = sqlite3.connect(self.db_path, timeout=self.timeout)
-        # Enable WAL mode for better concurrency
-        conn.execute("PRAGMA journal_mode=WAL")
+        try:
+            # Enable WAL mode for better concurrency
+            conn.execute("PRAGMA journal_mode=WAL")
+        except sqlite3.OperationalError as e:
+            # Fallback for network filesystems (NFS/CIFS) that don't support WAL
+            logger.warning(f"Could not enable WAL mode (likely a network mount): {e}. Falling back to TRUNCATE.")
+            conn.execute("PRAGMA journal_mode=TRUNCATE")
         return conn
 
     def _init_db(self):
