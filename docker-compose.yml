@@ -4,7 +4,7 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      - ./data:/data
+      - rss_data:/data
     environment:
       - ADMIN_USER=${ADMIN_USER:-admin}
       - ADMIN_PASS=${ADMIN_PASS:-password}
@@ -12,3 +12,6 @@ services:
       - FEED_PASS=${FEED_PASS}
       - DB_PATH=/data/cache.db
     restart: unless-stopped
+
+volumes:
+  rss_data:
