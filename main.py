@@ -63,6 +63,15 @@ class AtomSelfLink(rfeed.Serializable):
         self.handler = handler
         self._write_element("atom:link", None, {"href": self.url, "rel": "self", "type": "application/rss+xml"})
 
+class CDATA(rfeed.Serializable):
+    def __init__(self, text):
+        rfeed.Serializable.__init__(self)
+        self.text = text
+    def publish(self, handler):
+        handler.startElement("description", {})
+        handler.ignorableWhitespace(f"<![CDATA[{self.text}]]>")
+        handler.endElement("description")
+
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -399,17 +408,17 @@ async def get_rss(request: Request, username: Optional[str] = Depends(get_feed_u
     feed_url = f"{base_url}/rss"
 
     for art in latest_articles:
-        desc = art.get('description', '')
-        if desc and not desc.startswith("<![CDATA["):
-            desc = f"<![CDATA[{desc}]]>"
-            
         item = rfeed.Item(
             title=art.get('title', 'No Title'), 
             link=art.get('link', ''), 
-            description=desc,
+            # We use our custom CDATA extension instead of the default description field
+            # to prevent rfeed from escaping the HTML content.
+            extensions=[
+                DCCreator(art.get('source_title') or "Unknown Source"),
+                CDATA(art.get('description', ''))
+            ],
             guid=rfeed.Guid(art.get('guid', art.get('link', ''))), 
-            pubDate=datetime.datetime.fromisoformat(art['pub_date']),
-            extensions=[DCCreator(art.get('source_title') or "Unknown Source")]
+            pubDate=datetime.datetime.fromisoformat(art['pub_date'])
         )
         rss_items.append(item)
     
@@ -423,10 +432,7 @@ async def get_rss(request: Request, username: Optional[str] = Depends(get_feed_u
         extensions=[DCExtension(), AtomExtension(), AtomSelfLink(feed_url)]
     )
     
-    xml = feed.rss()
-    
-    # Ensure XML declaration and UTF-8 encoding
-    xml_content = '<?xml version="1.0" encoding="UTF-8" ?>\n' + xml
+    xml_content = feed.rss()
     
     return Response(
         content=xml_content, 
