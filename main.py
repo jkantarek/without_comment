@@ -38,6 +38,32 @@ from bs4 import BeautifulSoup
 
 import rfeed
 
+# Proper rfeed extension classes for maximum compatibility
+class DCExtension(rfeed.Extension):
+    def get_namespace(self):
+        return {"xmlns:dc": "http://purl.org/dc/elements/1.1/"}
+
+class DCCreator(rfeed.Serializable):
+    def __init__(self, name):
+        rfeed.Serializable.__init__(self)
+        self.name = name
+    def publish(self, handler):
+        self._write_element("dc:creator", self.name)
+
+class AtomExtension(rfeed.Extension):
+    def get_namespace(self):
+        return {"xmlns:atom": "http://www.w3.org/2005/Atom"}
+
+class AtomSelfLink(rfeed.Serializable):
+    def __init__(self, url):
+        rfeed.Serializable.__init__(self)
+        self.url = url
+    def publish(self, handler):
+        # rfeed's internal _write_element doesn't handle attributes easily, 
+        # so we use handler directly if needed, or just let the manual injection handle it.
+        # But to satisfy the aggregator, we'll use manual injection for the complex atom:link.
+        pass
+
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -382,37 +408,25 @@ async def get_rss(request: Request, username: Optional[str] = Depends(get_feed_u
             title=art.get('title', 'No Title'), 
             link=art.get('link', ''), 
             description=desc,
-            # GUID should be a permalink if it's a URL
-            guid=rfeed.Guid(art.get('guid', art.get('link', '')), isPermaLink=True), 
-            pubDate=datetime.datetime.fromisoformat(art['pub_date'])
+            guid=rfeed.Guid(art.get('guid', art.get('link', ''))), 
+            pubDate=datetime.datetime.fromisoformat(art['pub_date']),
+            extensions=[DCCreator(art.get('source_title') or "Unknown Source")]
         )
-        
-        # Add Dublin Core creator for the source name (better than <author> for names)
-        item.extensions.append(rfeed.Extension(
-            namespace={"xmlns:dc": "http://purl.org/dc/elements/1.1/"},
-            element={"dc:creator": art.get('source_title') or "Unknown Source"}
-        ))
-        
         rss_items.append(item)
     
     feed = rfeed.Feed(
         title="Unified Hydrated Feed", 
-        link=base_url, # Link back to the main site/dashboard
+        link=base_url,
         description="Unified Feed Management with Full Text Hydration", 
         language="en-US",
         lastBuildDate=datetime.datetime.now(), 
-        items=rss_items
+        items=rss_items,
+        extensions=[DCExtension(), AtomExtension()]
     )
     
-    # Manually inject the necessary namespaces and the Atom self link 
-    # since rfeed is a bit limited with top-level attributes
     xml = feed.rss()
     
-    # 1. Add Namespaces
-    xml = xml.replace('<rss version="2.0">', 
-                     '<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom" xmlns:dc="http://purl.org/dc/elements/1.1/">')
-    
-    # 2. Inject Atom Self Link into the channel
+    # Inject Atom Self Link manually as rfeed's _write_element doesn't support attributes easily
     atom_link = f'<atom:link href="{feed_url}" rel="self" type="application/rss+xml" />'
     xml = xml.replace('<channel>', f'<channel>\n    {atom_link}')
 
