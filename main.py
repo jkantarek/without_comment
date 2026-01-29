@@ -361,25 +361,54 @@ async def hydrate_article(url: str) -> Optional[str]:
             if page: await page.close()
 
 @app.get("/rss")
-async def get_rss(username: Optional[str] = Depends(get_feed_user)):
+async def get_rss(request: Request, username: Optional[str] = Depends(get_feed_user)):
+    # Log User-Agent to debug aggregator access
+    ua = request.headers.get("user-agent", "Unknown")
+    logger.info(f"RSS Feed requested by: {ua}")
+    
     latest_articles = cache.get_latest_hydrated(30)
     rss_items = []
     for art in latest_articles:
+        # Wrap description in CDATA to ensure HTML is preserved and valid
+        desc = art.get('description', '')
+        if desc and not desc.startswith("<![CDATA["):
+            desc = f"<![CDATA[{desc}]]>"
+            
         item = rfeed.Item(
             title=art.get('title', 'No Title'), 
             link=art.get('link', ''), 
-            description=art.get('description', ''),
+            description=desc,
             author=art.get('source_title') or "Unknown Source",
             guid=rfeed.Guid(art.get('guid', art.get('link', ''))), 
             pubDate=datetime.datetime.fromisoformat(art['pub_date'])
         )
         rss_items.append(item)
+    
+    # Try to determine current base URL for the 'self' link
+    base_url = str(request.base_url).rstrip('/')
+    
     feed = rfeed.Feed(
-        title="Unified Hydrated Feed", link="http://localhost:8000/rss",
-        description="Unified Feed Management", language="en-US",
-        lastBuildDate=datetime.datetime.now(), items=rss_items
+        title="Unified Hydrated Feed", 
+        link=f"{base_url}/rss",
+        description="Unified Feed Management", 
+        language="en-US",
+        lastBuildDate=datetime.datetime.now(), 
+        items=rss_items,
+        extensions=[
+            # Some aggregators like a self-referencing link in Atom format
+            # rfeed doesn't have a direct 'atom:link' helper, but we can try 
+            # to inject it or just rely on standard RSS fields.
+        ]
     )
-    return Response(content=feed.rss(), media_type="application/xml")
+    
+    # Ensure XML declaration and UTF-8 encoding
+    xml_content = '<?xml version="1.0" encoding="UTF-8" ?>' + feed.rss()
+    
+    return Response(
+        content=xml_content, 
+        media_type="application/rss+xml",
+        headers={"Content-Type": "application/rss+xml; charset=utf-8"}
+    )
 
 # Admin UI and Management
 @app.get("/admin", response_class=HTMLResponse)
