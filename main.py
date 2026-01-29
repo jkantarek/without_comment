@@ -48,6 +48,7 @@ class DCCreator(rfeed.Serializable):
         rfeed.Serializable.__init__(self)
         self.name = name
     def publish(self, handler):
+        self.handler = handler
         self._write_element("dc:creator", self.name)
 
 class AtomExtension(rfeed.Extension):
@@ -59,10 +60,8 @@ class AtomSelfLink(rfeed.Serializable):
         rfeed.Serializable.__init__(self)
         self.url = url
     def publish(self, handler):
-        # rfeed's internal _write_element doesn't handle attributes easily, 
-        # so we use handler directly if needed, or just let the manual injection handle it.
-        # But to satisfy the aggregator, we'll use manual injection for the complex atom:link.
-        pass
+        self.handler = handler
+        self._write_element("atom:link", None, {"href": self.url, "rel": "self", "type": "application/rss+xml"})
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -421,15 +420,11 @@ async def get_rss(request: Request, username: Optional[str] = Depends(get_feed_u
         language="en-US",
         lastBuildDate=datetime.datetime.now(), 
         items=rss_items,
-        extensions=[DCExtension(), AtomExtension()]
+        extensions=[DCExtension(), AtomExtension(), AtomSelfLink(feed_url)]
     )
     
     xml = feed.rss()
     
-    # Inject Atom Self Link manually as rfeed's _write_element doesn't support attributes easily
-    atom_link = f'<atom:link href="{feed_url}" rel="self" type="application/rss+xml" />'
-    xml = xml.replace('<channel>', f'<channel>\n    {atom_link}')
-
     # Ensure XML declaration and UTF-8 encoding
     xml_content = '<?xml version="1.0" encoding="UTF-8" ?>\n' + xml
     
