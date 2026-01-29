@@ -52,13 +52,12 @@ FEED_USER = os.environ.get("FEED_USER")
 FEED_PASS = os.environ.get("FEED_PASS")
 
 def get_current_user(credentials: HTTPBasicCredentials = Depends(security)):
-    if not ADMIN_USER or not ADMIN_PASS:
-        # If env vars aren't set, we can't let anyone in for safety
-        logger.error("ADMIN_USER or ADMIN_PASS not set in environment.")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Server authentication not configured."
-        )
+    if not ADMIN_USER:
+        logger.error("ADMIN_USER not set in environment.")
+        raise HTTPException(status_code=500, detail="ADMIN_USER not configured.")
+    if not ADMIN_PASS:
+        logger.error("ADMIN_PASS not set in environment.")
+        raise HTTPException(status_code=500, detail="ADMIN_PASS not configured.")
     
     current_username_bytes = credentials.username.encode("utf8")
     correct_username_bytes = ADMIN_USER.encode("utf8")

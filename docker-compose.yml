@@ -6,10 +6,10 @@ services:
     volumes:
       - rss_data:/data
     environment:
-      - ADMIN_USER=${ADMIN_USER:-admin}
-      - ADMIN_PASS=${ADMIN_PASS:-password}
-      - FEED_USER=${FEED_USER}
-      - FEED_PASS=${FEED_PASS}
+      - ADMIN_USER
+      - ADMIN_PASS
+      - FEED_USER
+      - FEED_PASS
       - DB_PATH=/data/cache.db
     restart: unless-stopped
 
