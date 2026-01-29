@@ -368,8 +368,12 @@ async def get_rss(request: Request, username: Optional[str] = Depends(get_feed_u
     
     latest_articles = cache.get_latest_hydrated(30)
     rss_items = []
+    
+    # Try to determine current base URL for the 'self' link
+    base_url = str(request.base_url).rstrip('/')
+    feed_url = f"{base_url}/rss"
+
     for art in latest_articles:
-        # Wrap description in CDATA to ensure HTML is preserved and valid
         desc = art.get('description', '')
         if desc and not desc.startswith("<![CDATA["):
             desc = f"<![CDATA[{desc}]]>"
@@ -378,31 +382,42 @@ async def get_rss(request: Request, username: Optional[str] = Depends(get_feed_u
             title=art.get('title', 'No Title'), 
             link=art.get('link', ''), 
             description=desc,
-            author=art.get('source_title') or "Unknown Source",
-            guid=rfeed.Guid(art.get('guid', art.get('link', ''))), 
+            # GUID should be a permalink if it's a URL
+            guid=rfeed.Guid(art.get('guid', art.get('link', '')), isPermaLink=True), 
             pubDate=datetime.datetime.fromisoformat(art['pub_date'])
         )
+        
+        # Add Dublin Core creator for the source name (better than <author> for names)
+        item.extensions.append(rfeed.Extension(
+            namespace={"xmlns:dc": "http://purl.org/dc/elements/1.1/"},
+            element={"dc:creator": art.get('source_title') or "Unknown Source"}
+        ))
+        
         rss_items.append(item)
-    
-    # Try to determine current base URL for the 'self' link
-    base_url = str(request.base_url).rstrip('/')
     
     feed = rfeed.Feed(
         title="Unified Hydrated Feed", 
-        link=f"{base_url}/rss",
-        description="Unified Feed Management", 
+        link=base_url, # Link back to the main site/dashboard
+        description="Unified Feed Management with Full Text Hydration", 
         language="en-US",
         lastBuildDate=datetime.datetime.now(), 
-        items=rss_items,
-        extensions=[
-            # Some aggregators like a self-referencing link in Atom format
-            # rfeed doesn't have a direct 'atom:link' helper, but we can try 
-            # to inject it or just rely on standard RSS fields.
-        ]
+        items=rss_items
     )
     
+    # Manually inject the necessary namespaces and the Atom self link 
+    # since rfeed is a bit limited with top-level attributes
+    xml = feed.rss()
+    
+    # 1. Add Namespaces
+    xml = xml.replace('<rss version="2.0">', 
+                     '<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom" xmlns:dc="http://purl.org/dc/elements/1.1/">')
+    
+    # 2. Inject Atom Self Link into the channel
+    atom_link = f'<atom:link href="{feed_url}" rel="self" type="application/rss+xml" />'
+    xml = xml.replace('<channel>', f'<channel>\n    {atom_link}')
+
     # Ensure XML declaration and UTF-8 encoding
-    xml_content = '<?xml version="1.0" encoding="UTF-8" ?>' + feed.rss()
+    xml_content = '<?xml version="1.0" encoding="UTF-8" ?>\n' + xml
     
     return Response(
         content=xml_content, 
