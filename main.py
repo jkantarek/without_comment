@@ -204,11 +204,16 @@ class FeedCache:
         except Exception as e:
             logger.error(f"DB Error: {e}")
 
-    def get_latest_hydrated(self, limit=30):
+    def get_latest_articles(self, limit=100):
         with self._get_conn() as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.execute("SELECT * FROM articles WHERE hydrated = 1 ORDER BY pub_date DESC LIMIT ?", (limit,))
             return [dict(row) for row in cursor.fetchall()]
+
+    def get_unhydrated_count(self):
+        with self._get_conn() as conn:
+            cursor = conn.execute("SELECT COUNT(*) FROM articles WHERE hydrated = 0")
+            return cursor.fetchone()[0]
 
     def get_unhydrated(self, limit=50):
         with self._get_conn() as conn:
@@ -274,40 +279,65 @@ REPO_HANDLERS = {
     "bitbucket.org": {"selector": "#readme-section", "wait_for": "#readme-section"}
 }
 
+async def refresh_feed(f, global_ignores):
+    url = f['url']
+    local_ignores = json.loads(f['ignore_domains'])
+    combined_ignores = global_ignores + local_ignores
+    try:
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+            resp = await client.get(url)
+            feed_data = feedparser.parse(resp.text)
+            feed_title = getattr(feed_data.feed, 'title', 'Unknown Source')
+            count = 0
+            for entry in feed_data.entries:
+                link = getattr(entry, 'link', '')
+                guid = getattr(entry, 'id', link)
+                if any(domain in link for domain in combined_ignores): continue
+                if not cache.get_article(guid):
+                    title = getattr(entry, 'title', 'No Title')
+                    pd = getattr(entry, 'published_parsed', getattr(entry, 'updated_parsed', None))
+                    pub_dt = datetime.datetime(*pd[:6]).isoformat() if pd else datetime.datetime.now().isoformat()
+                    cache.save_article(guid, link, title, getattr(entry, 'description', ''), pub_dt, source_title=feed_title, hydrated=0)
+                    count += 1
+            if count > 0:
+                logger.info(f"Added {count} new articles from {feed_title}")
+    except Exception as e:
+        logger.error(f"Error refreshing feed {url}: {e}")
+
+async def hydrate_and_save(article):
+    try:
+        content = await hydrate_article(article['link'])
+        cache.save_article(article['guid'], article['link'], article['title'], 
+                         content if content else article['description'], 
+                         article['pub_date'], 
+                         source_title=article['source_title'],
+                         hydrated=1 if content else 2)
+    except Exception as e:
+        logger.error(f"Error hydrating article {article['guid']}: {e}")
+
 async def background_refresh_task():
     while True:
         try:
+            logger.info("Starting background refresh cycle...")
             feeds = cache.get_feeds()
             global_ignores = cache.get_global_ignores()
-            for f in feeds:
-                url = f['url']
-                local_ignores = json.loads(f['ignore_domains'])
-                combined_ignores = global_ignores + local_ignores
-                try:
-                    async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
-                        resp = await client.get(url)
-                        feed_data = feedparser.parse(resp.text)
-                        feed_title = getattr(feed_data.feed, 'title', 'Unknown Source')
-                        for entry in feed_data.entries:
-                            link = getattr(entry, 'link', '')
-                            guid = getattr(entry, 'id', link)
-                            if any(domain in link for domain in combined_ignores): continue
-                            if not cache.get_article(guid):
-                                title = getattr(entry, 'title', 'No Title')
-                                pd = getattr(entry, 'published_parsed', getattr(entry, 'updated_parsed', None))
-                                pub_dt = datetime.datetime(*pd[:6]).isoformat() if pd else datetime.datetime.now().isoformat()
-                                cache.save_article(guid, link, title, getattr(entry, 'description', ''), pub_dt, source_title=feed_title, hydrated=0)
-                except: pass
+            
+            # Parallel feed refresh
+            await asyncio.gather(*[refresh_feed(f, global_ignores) for f in feeds], return_exceptions=True)
 
-            latest_unhydrated = cache.get_unhydrated(20)
-            for article in latest_unhydrated:
-                content = await hydrate_article(article['link'])
-                cache.save_article(article['guid'], article['link'], article['title'], 
-                                 content if content else article['description'], 
-                                 article['pub_date'], 
-                                 source_title=article['source_title'],
-                                 hydrated=1 if content else 2)
-        except: pass
+            # Process a larger batch of unhydrated articles in parallel (respecting semaphore)
+            unhydrated_count = cache.get_unhydrated_count()
+            logger.info(f"Pending hydration queue size: {unhydrated_count}")
+            
+            latest_unhydrated = cache.get_unhydrated(50) # Increased batch size
+            if latest_unhydrated:
+                logger.info(f"Hydrating {len(latest_unhydrated)} articles...")
+                await asyncio.gather(*[hydrate_and_save(a) for a in latest_unhydrated], return_exceptions=True)
+            
+            logger.info("Background refresh cycle complete.")
+        except Exception as e:
+            logger.error(f"Error in background_refresh_task: {e}")
+        
         await asyncio.sleep(600)
 
 @asynccontextmanager
@@ -400,7 +430,7 @@ async def get_rss(request: Request, username: Optional[str] = Depends(get_feed_u
     ua = request.headers.get("user-agent", "Unknown")
     logger.info(f"RSS Feed requested by: {ua}")
     
-    latest_articles = cache.get_latest_hydrated(30)
+    latest_articles = cache.get_latest_articles(100)
     rss_items = []
     
     # Try to determine current base URL for the 'self' link
