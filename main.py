@@ -161,17 +161,19 @@ class FeedCache:
                     title TEXT,
                     description TEXT,
                     source_title TEXT,
+                    feed_url TEXT,
                     pub_date TIMESTAMP,
                     hydrated INTEGER DEFAULT 0,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
-            # Migration: Add source_title if it doesn't exist
+            # Migrations
             try:
                 conn.execute("ALTER TABLE articles ADD COLUMN source_title TEXT")
-            except sqlite3.OperationalError:
-                # Column already exists
-                pass
+            except sqlite3.OperationalError: pass
+            try:
+                conn.execute("ALTER TABLE articles ADD COLUMN feed_url TEXT")
+            except sqlite3.OperationalError: pass
 
             # Feeds table
             conn.execute("""
@@ -193,16 +195,38 @@ class FeedCache:
             cursor = conn.execute("SELECT * FROM articles WHERE guid = ?", (guid,))
             return cursor.fetchone()
 
-    def save_article(self, guid, link, title, description, pub_date, source_title=None, hydrated=0):
+    def save_article(self, guid, link, title, description, pub_date, source_title=None, feed_url=None, hydrated=0):
         try:
             with self._get_conn() as conn:
                 conn.execute("""
-                    INSERT OR REPLACE INTO articles (guid, link, title, description, source_title, pub_date, hydrated)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                """, (guid, link, title, description, source_title, pub_date, hydrated))
+                    INSERT INTO articles (guid, link, title, description, source_title, feed_url, pub_date, hydrated)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(guid) DO UPDATE SET
+                        feed_url = COALESCE(excluded.feed_url, articles.feed_url),
+                        source_title = COALESCE(excluded.source_title, articles.source_title),
+                        hydrated = CASE WHEN excluded.hydrated > articles.hydrated THEN excluded.hydrated ELSE articles.hydrated END,
+                        description = CASE WHEN excluded.hydrated > articles.hydrated THEN excluded.description ELSE articles.description END
+                """, (guid, link, title, description, source_title, feed_url, pub_date, hydrated))
                 conn.commit()
         except Exception as e:
             logger.error(f"DB Error: {e}")
+
+    def backfill_feed_urls(self):
+        try:
+            with self._get_conn() as conn:
+                conn.row_factory = sqlite3.Row
+                feeds = conn.execute("SELECT url FROM feeds").fetchall()
+                for f in feeds:
+                    url = f['url']
+                    domain = urlparse(url).netloc
+                    if domain.startswith("www."): domain = domain[4:]
+                    if domain:
+                        conn.execute("UPDATE articles SET feed_url = ? WHERE feed_url IS NULL AND link LIKE ?", 
+                                   (url, f"%{domain}%"))
+                conn.commit()
+                logger.info("Backfilled missing feed_urls for existing articles.")
+        except Exception as e:
+            logger.error(f"Backfill error: {e}")
 
     def get_latest_articles(self, limit=100):
         with self._get_conn() as conn:
@@ -214,6 +238,24 @@ class FeedCache:
         with self._get_conn() as conn:
             cursor = conn.execute("SELECT COUNT(*) FROM articles WHERE hydrated = 0")
             return cursor.fetchone()[0]
+
+    def get_stats(self):
+        with self._get_conn() as conn:
+            cursor = conn.execute("""
+                SELECT 
+                    COUNT(*) as total,
+                    SUM(CASE WHEN hydrated = 1 THEN 1 ELSE 0 END) as hydrated,
+                    SUM(CASE WHEN hydrated = 0 THEN 1 ELSE 0 END) as pending,
+                    SUM(CASE WHEN hydrated = 2 THEN 1 ELSE 0 END) as failed
+                FROM articles
+            """)
+            row = cursor.fetchone()
+            return {
+                "total": row[0] or 0,
+                "hydrated": row[1] or 0,
+                "pending": row[2] or 0,
+                "failed": row[3] or 0
+            }
 
     def get_unhydrated(self, limit=50):
         with self._get_conn() as conn:
@@ -238,6 +280,22 @@ class FeedCache:
             cursor = conn.execute("SELECT * FROM feeds")
             return [dict(row) for row in cursor.fetchall()]
 
+    def get_feeds_with_stats(self):
+        with self._get_conn() as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.execute("""
+                SELECT 
+                    f.*,
+                    COUNT(a.guid) as total_count,
+                    SUM(CASE WHEN a.hydrated = 1 THEN 1 ELSE 0 END) as hydrated_count,
+                    SUM(CASE WHEN a.hydrated = 0 THEN 1 ELSE 0 END) as pending_count,
+                    SUM(CASE WHEN a.hydrated = 2 THEN 1 ELSE 0 END) as failed_count
+                FROM feeds f
+                LEFT JOIN articles a ON f.url = a.feed_url
+                GROUP BY f.url
+            """)
+            return [dict(row) for row in cursor.fetchall()]
+
     def add_global_ignore(self, domain):
         with self._get_conn() as conn:
             conn.execute("INSERT OR IGNORE INTO global_ignores (domain) VALUES (?)", (domain,))
@@ -254,6 +312,7 @@ class FeedCache:
             return [row[0] for row in cursor.fetchall()]
 
 cache = FeedCache(DB_PATH)
+last_refresh_time = None
 
 def sync_config_to_db():
     if not os.path.exists("config.yaml"): return
@@ -293,29 +352,51 @@ async def refresh_feed(f, global_ignores):
                 link = getattr(entry, 'link', '')
                 guid = getattr(entry, 'id', link)
                 if any(domain in link for domain in combined_ignores): continue
-                if not cache.get_article(guid):
-                    title = getattr(entry, 'title', 'No Title')
-                    pd = getattr(entry, 'published_parsed', getattr(entry, 'updated_parsed', None))
-                    pub_dt = datetime.datetime(*pd[:6]).isoformat() if pd else datetime.datetime.now().isoformat()
-                    cache.save_article(guid, link, title, getattr(entry, 'description', ''), pub_dt, source_title=feed_title, hydrated=0)
-                    count += 1
+                
+                title = getattr(entry, 'title', 'No Title')
+                pd = getattr(entry, 'published_parsed', getattr(entry, 'updated_parsed', None))
+                pub_dt = datetime.datetime(*pd[:6]).isoformat() if pd else datetime.datetime.now().isoformat()
+                
+                # save_article now handles ON CONFLICT to backfill feed_url/source_title safely
+                cache.save_article(guid, link, title, getattr(entry, 'description', ''), pub_dt, source_title=feed_title, feed_url=url, hydrated=0)
+                count += 1
             if count > 0:
                 logger.info(f"Added {count} new articles from {feed_title}")
     except Exception as e:
         logger.error(f"Error refreshing feed {url}: {e}")
 
 async def hydrate_and_save(article):
+    guid = article['guid']
+    url = article['link']
     try:
-        content = await hydrate_article(article['link'])
-        cache.save_article(article['guid'], article['link'], article['title'], 
-                         content if content else article['description'], 
+        content = await hydrate_article(url)
+        if content:
+            logger.info(f"SUCCESS: Hydrated '{article['title']}' ({guid})")
+            cache.save_article(guid, url, article['title'], 
+                             content, 
+                             article['pub_date'], 
+                             source_title=article['source_title'],
+                             feed_url=article.get('feed_url'),
+                             hydrated=1)
+        else:
+            logger.warning(f"FAILURE: Could not extract content for '{article['title']}' ({guid}). Marking as failed.")
+            cache.save_article(guid, url, article['title'], 
+                             article['description'], 
+                             article['pub_date'], 
+                             source_title=article['source_title'],
+                             feed_url=article.get('feed_url'),
+                             hydrated=2)
+    except Exception as e:
+        logger.error(f"CRITICAL FAILURE: Error during hydration task for '{article['title']}' ({guid}): {e}")
+        cache.save_article(guid, url, article['title'], 
+                         article['description'], 
                          article['pub_date'], 
                          source_title=article['source_title'],
-                         hydrated=1 if content else 2)
-    except Exception as e:
-        logger.error(f"Error hydrating article {article['guid']}: {e}")
+                         feed_url=article.get('feed_url'),
+                         hydrated=2)
 
 async def background_refresh_task():
+    global last_refresh_time
     while True:
         try:
             logger.info("Starting background refresh cycle...")
@@ -334,6 +415,7 @@ async def background_refresh_task():
                 logger.info(f"Hydrating {len(latest_unhydrated)} articles...")
                 await asyncio.gather(*[hydrate_and_save(a) for a in latest_unhydrated], return_exceptions=True)
             
+            last_refresh_time = datetime.datetime.now()
             logger.info("Background refresh cycle complete.")
         except Exception as e:
             logger.error(f"Error in background_refresh_task: {e}")
@@ -344,6 +426,7 @@ async def background_refresh_task():
 async def lifespan(app: FastAPI):
     global browser_instance, playwright_manager
     sync_config_to_db()
+    cache.backfill_feed_urls()
     playwright_manager = await async_playwright().start()
     browser_instance = await playwright_manager.firefox.launch(headless=True)
     refresh_task = asyncio.create_task(background_refresh_task())
@@ -378,16 +461,22 @@ def clean_html(html_content: str, base_url: str) -> str:
     return str(soup)
 
 async def hydrate_article(url: str) -> Optional[str]:
-    if not browser_instance: return None
+    if not browser_instance:
+        logger.warning("Hydration skipped: Browser instance not initialized.")
+        return None
     async with hydration_semaphore:
         page = None
         try:
             domain = urlparse(url).netloc.lower()
             if domain.startswith("www."): domain = domain[4:]
+            logger.info(f"Hydrating: {url} (Domain: {domain})")
+            
             handler = REPO_HANDLERS.get(domain)
             page = await browser_instance.new_page()
             await page.set_extra_http_headers({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0"})
             await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            
+            # ... evaluation script ...
             await page.evaluate("""async () => {
                 await new Promise((resolve) => {
                     let totalHeight = 0; let distance = 200;
@@ -410,17 +499,32 @@ async def hydrate_article(url: str) -> Optional[str]:
                 });
             }""")
             await asyncio.sleep(1)
+            
             if handler:
                 try:
+                    logger.info(f"Using specialized handler for {domain}")
                     await page.wait_for_selector(handler['wait_for'], timeout=5000)
                     readme_html = await page.inner_html(handler['selector'])
-                    if readme_html: return clean_html(readme_html, url)
-                except: pass
+                    if readme_html: 
+                        cleaned = clean_html(readme_html, url)
+                        logger.info(f"Successfully extracted content using {domain} handler ({len(cleaned)} chars)")
+                        return cleaned
+                except Exception as e:
+                    logger.warning(f"Specialized handler failed for {url}: {e}")
+            
             content = await page.content()
             doc = Document(content)
             summary_html = doc.summary()
-            return clean_html(summary_html, url) if summary_html else None
-        except: return None
+            if summary_html:
+                cleaned = clean_html(summary_html, url)
+                logger.info(f"Successfully extracted summary using readability ({len(cleaned)} chars)")
+                return cleaned
+            
+            logger.warning(f"No content extracted for {url}")
+            return None
+        except Exception as e:
+            logger.error(f"Hydration error for {url}: {type(e).__name__}: {str(e)}")
+            return None
         finally:
             if page: await page.close()
 
@@ -473,17 +577,58 @@ async def get_rss(request: Request, username: Optional[str] = Depends(get_feed_u
 # Admin UI and Management
 @app.get("/admin", response_class=HTMLResponse)
 async def admin_page(username: str = Depends(get_current_user)):
-    feeds = cache.get_feeds()
+    feeds = cache.get_feeds_with_stats()
     ignores = cache.get_global_ignores()
+    stats = cache.get_stats()
+    
+    refresh_str = last_refresh_time.strftime("%Y-%m-%d %H:%M:%S") if last_refresh_time else "Never"
+    
+    stats_html = f"""
+    <div class="row mb-4">
+        <div class="col-md-3">
+            <div class="card bg-primary text-white text-center p-3 shadow-sm">
+                <div class="h4 mb-0">{stats['total']}</div>
+                <small>Total Articles</small>
+            </div>
+        </div>
+        <div class="col-md-3">
+            <div class="card bg-success text-white text-center p-3 shadow-sm">
+                <div class="h4 mb-0">{stats['hydrated']}</div>
+                <small>Hydrated</small>
+            </div>
+        </div>
+        <div class="col-md-3">
+            <div class="card bg-warning text-dark text-center p-3 shadow-sm">
+                <div class="h4 mb-0">{stats['pending']}</div>
+                <small>Pending Hydration Queue</small>
+            </div>
+        </div>
+        <div class="col-md-3">
+            <div class="card bg-danger text-white text-center p-3 shadow-sm">
+                <div class="h4 mb-0">{stats['failed']}</div>
+                <small>Failed</small>
+            </div>
+        </div>
+    </div>
+    <div class="alert alert-info py-2 shadow-sm">
+        <strong>Last Background Refresh:</strong> {refresh_str} (Interval: 10m)
+    </div>
+    """
     
     feed_rows = "".join([f"""
         <tr>
-            <td>{f['url']}</td>
-            <td><code>{f['ignore_domains']}</code></td>
+            <td>
+                <div class="fw-bold">{f['url']}</div>
+                <small class="text-muted"><code>{f['ignore_domains']}</code></small>
+            </td>
+            <td class="text-center"><span class="badge bg-primary">{f['total_count']}</span></td>
+            <td class="text-center"><span class="badge bg-success">{f['hydrated_count'] or 0}</span></td>
+            <td class="text-center"><span class="badge bg-warning text-dark">{f['pending_count'] or 0}</span></td>
+            <td class="text-center"><span class="badge bg-danger">{f['failed_count'] or 0}</span></td>
             <td>
                 <form action="/admin/delete-feed" method="post" style="display:inline">
                     <input type="hidden" name="url" value="{f['url']}">
-                    <button type="submit" class="btn btn-sm btn-danger">Delete</button>
+                    <button type="submit" class="btn btn-sm btn-outline-danger">Delete</button>
                 </form>
             </td>
         </tr>
@@ -505,27 +650,56 @@ async def admin_page(username: str = Depends(get_current_user)):
     <head>
         <title>RSS Aggregator Admin</title>
         <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+        <style>
+            .table th {{ font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05rem; }}
+        </style>
     </head>
     <body class="bg-light">
         <div class="container py-5">
-            <h1 class="mb-4">RSS Feed Management</h1>
+            <div class="d-flex justify-content-between align-items-center mb-4">
+                <h1>RSS Feed Management</h1>
+                <a href="/rss" class="btn btn-outline-secondary" target="_blank">View RSS Feed</a>
+            </div>
+            
+            {stats_html}
             
             <div class="row">
-                <div class="col-md-8">
+                <div class="col-md-9">
                     <div class="card mb-4 shadow-sm">
                         <div class="card-header bg-primary text-white">Add New Feed</div>
                         <div class="card-body">
                             <form action="/admin/add-feed" method="post">
-                                <div class="mb-3">
-                                    <label class="form-label">RSS Feed URL</label>
-                                    <input type="url" name="url" class="form-control" placeholder="https://example.com/rss" required>
+                                <div class="row">
+                                    <div class="col-md-7">
+                                        <input type="url" name="url" class="form-control" placeholder="https://example.com/rss" required>
+                                    </div>
+                                    <div class="col-md-3">
+                                        <input type="text" name="ignores" class="form-control" placeholder="ads.com, track.it">
+                                    </div>
+                                    <div class="col-md-2">
+                                        <button type="submit" class="btn btn-primary w-100">Add</button>
+                                    </div>
                                 </div>
-                                <div class="mb-3">
-                                    <label class="form-label">Ignore Domains (comma separated)</label>
-                                    <input type="text" name="ignores" class="form-control" placeholder="ads.com, track.it">
-                                </div>
-                                <button type="submit" class="btn btn-primary">Add Feed</button>
                             </form>
+                        </div>
+                    </div>
+
+                    <div class="card shadow-sm mb-4">
+                        <div class="card-header bg-dark text-white">Active Feeds</div>
+                        <div class="card-body p-0">
+                            <table class="table table-hover mb-0 align-middle">
+                                <thead class="table-light">
+                                    <tr>
+                                        <th>Feed URL & Ignores</th>
+                                        <th class="text-center">Total</th>
+                                        <th class="text-center">Hydrated</th>
+                                        <th class="text-center">Pending</th>
+                                        <th class="text-center">Failed</th>
+                                        <th>Action</th>
+                                    </tr>
+                                </thead>
+                                <tbody>{feed_rows}</tbody>
+                            </table>
                         </div>
                     </div>
 
@@ -534,38 +708,25 @@ async def admin_page(username: str = Depends(get_current_user)):
                         <div class="card-body">
                             <form action="/admin/bulk-import" method="post">
                                 <div class="mb-3">
-                                    <label class="form-label">Feed URLs (one per line)</label>
-                                    <textarea name="urls" class="form-control" rows="5" placeholder="https://site1.com/rss&#10;https://site2.com/feed" required></textarea>
+                                    <textarea name="urls" class="form-control" rows="3" placeholder="https://site1.com/rss&#10;https://site2.com/feed" required></textarea>
                                 </div>
-                                <button type="submit" class="btn btn-success">Bulk Add</button>
+                                <button type="submit" class="btn btn-success btn-sm">Bulk Add</button>
                             </form>
-                        </div>
-                    </div>
-
-                    <div class="card shadow-sm">
-                        <div class="card-header bg-dark text-white">Active Feeds</div>
-                        <div class="card-body p-0">
-                            <table class="table table-hover mb-0">
-                                <thead class="table-light">
-                                    <tr><th>URL</th><th>Per-Feed Ignores</th><th>Action</th></tr>
-                                </thead>
-                                <tbody>{feed_rows}</tbody>
-                            </table>
                         </div>
                     </div>
                 </div>
 
-                <div class="col-md-4">
+                <div class="col-md-3">
                     <div class="card shadow-sm">
                         <div class="card-header bg-secondary text-white">Global Ignore List</div>
                         <div class="card-body">
                             <form action="/admin/add-ignore" method="post" class="mb-3">
-                                <div class="input-group">
+                                <div class="input-group input-group-sm">
                                     <input type="text" name="domain" class="form-control" placeholder="example.com" required>
                                     <button class="btn btn-outline-primary" type="submit">Add</button>
                                 </div>
                             </form>
-                            <ul class="list-group">{ignore_rows}</ul>
+                            <ul class="list-group list-group-flush">{ignore_rows}</ul>
                         </div>
                     </div>
                 </div>
