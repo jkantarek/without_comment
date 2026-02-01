@@ -343,9 +343,12 @@ async def expand_libhunt_newsletter(newsletter_url, client, feed_title, feed_url
     try:
         resp = await client.get(newsletter_url)
         soup = BeautifulSoup(resp.text, 'html.parser')
-        stories = soup.select('li.story:not(#sponsored)')
+        stories = soup.select('li.story')
         expanded_count = 0
         for story in stories:
+            if story.get('id') == 'sponsored':
+                continue
+                
             title_link = story.select_one('a.title')
             if not title_link: continue
             
