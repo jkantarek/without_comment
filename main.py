@@ -335,7 +335,8 @@ REPO_HANDLERS = {
     "github.com": {"selector": "article.markdown-body", "wait_for": "article.markdown-body"},
     "gitlab.com": {"selector": ".readme-holder .blob-content", "wait_for": ".readme-holder"},
     "codeberg.org": {"selector": ".readme", "wait_for": ".readme"},
-    "bitbucket.org": {"selector": "#readme-section", "wait_for": "#readme-section"}
+    "bitbucket.org": {"selector": "#readme-section", "wait_for": "#readme-section"},
+    "knowablemagazine.org": {"selector": ".article-container", "wait_for": ".article-container"}
 }
 
 async def refresh_feed(f, global_ignores):
