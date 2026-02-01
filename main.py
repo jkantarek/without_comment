@@ -339,6 +339,34 @@ REPO_HANDLERS = {
     "knowablemagazine.org": {"selector": ".article-container", "wait_for": ".article-container"}
 }
 
+async def expand_libhunt_newsletter(newsletter_url, client, feed_title, feed_url, combined_ignores, pub_dt):
+    try:
+        resp = await client.get(newsletter_url)
+        soup = BeautifulSoup(resp.text, 'html.parser')
+        stories = soup.select('li.story:not(#sponsored)')
+        expanded_count = 0
+        for story in stories:
+            title_link = story.select_one('a.title')
+            if not title_link: continue
+            
+            link = title_link.get('href', '')
+            title = title_link.get_text(strip=True)
+            desc_node = story.select_one('p.description')
+            description = desc_node.get_text(strip=True) if desc_node else ""
+            if "» Learn more" in description:
+                description = description.split("» Learn more")[0].strip()
+            
+            if not link or any(domain in link for domain in combined_ignores):
+                continue
+            
+            # Use the story link as GUID to avoid duplicates across newsletters
+            cache.save_article(link, link, title, description, pub_dt, source_title=f"{feed_title}", feed_url=feed_url, hydrated=0)
+            expanded_count += 1
+        return expanded_count
+    except Exception as e:
+        logger.error(f"Error expanding libhunt newsletter {newsletter_url}: {e}")
+        return 0
+
 async def refresh_feed(f, global_ignores):
     url = f['url']
     local_ignores = json.loads(f['ignore_domains'])
@@ -358,6 +386,13 @@ async def refresh_feed(f, global_ignores):
                 pd = getattr(entry, 'published_parsed', getattr(entry, 'updated_parsed', None))
                 pub_dt = datetime.datetime(*pd[:6]).isoformat() if pd else datetime.datetime.now().isoformat()
                 
+                # Special handling for LibHunt newsletter feeds to break out individual stories
+                if "libhunt.com" in url.lower() and "/newsletter/" in link.lower() and not link.lower().endswith("/feed"):
+                    expanded = await expand_libhunt_newsletter(link, client, feed_title, url, combined_ignores, pub_dt)
+                    if expanded > 0:
+                        count += expanded
+                        continue # Skip saving the main newsletter edition entry
+
                 # save_article now handles ON CONFLICT to backfill feed_url/source_title safely
                 cache.save_article(guid, link, title, getattr(entry, 'description', ''), pub_dt, source_title=feed_title, feed_url=url, hydrated=0)
                 count += 1
