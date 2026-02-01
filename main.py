@@ -228,7 +228,7 @@ class FeedCache:
         except Exception as e:
             logger.error(f"Backfill error: {e}")
 
-    def get_latest_articles(self, limit=100):
+    def get_latest_articles(self, limit=500):
         with self._get_conn() as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.execute("SELECT * FROM articles WHERE hydrated = 1 ORDER BY pub_date DESC LIMIT ?", (limit,))
@@ -329,7 +329,7 @@ def sync_config_to_db():
 
 browser_instance: Optional[Browser] = None
 playwright_manager = None
-hydration_semaphore = asyncio.Semaphore(2)
+hydration_semaphore = asyncio.Semaphore(5)
 
 REPO_HANDLERS = {
     "github.com": {"selector": "article.markdown-body", "wait_for": "article.markdown-body"},
@@ -406,13 +406,19 @@ async def background_refresh_task():
             # Parallel feed refresh
             await asyncio.gather(*[refresh_feed(f, global_ignores) for f in feeds], return_exceptions=True)
 
-            # Process a larger batch of unhydrated articles in parallel (respecting semaphore)
-            unhydrated_count = cache.get_unhydrated_count()
-            logger.info(f"Pending hydration queue size: {unhydrated_count}")
-            
-            latest_unhydrated = cache.get_unhydrated(50) # Increased batch size
-            if latest_unhydrated:
-                logger.info(f"Hydrating {len(latest_unhydrated)} articles...")
+            # Keep hydrating in batches until the queue is cleared
+            while True:
+                unhydrated_count = cache.get_unhydrated_count()
+                if unhydrated_count == 0:
+                    logger.info("Hydration queue is empty.")
+                    break
+                    
+                logger.info(f"Hydration queue: {unhydrated_count} pending. Processing next batch...")
+                latest_unhydrated = cache.get_unhydrated(50) 
+                if not latest_unhydrated:
+                    break
+                    
+                # Process batch in parallel (respecting semaphore)
                 await asyncio.gather(*[hydrate_and_save(a) for a in latest_unhydrated], return_exceptions=True)
             
             last_refresh_time = datetime.datetime.now()
@@ -534,7 +540,7 @@ async def get_rss(request: Request, username: Optional[str] = Depends(get_feed_u
     ua = request.headers.get("user-agent", "Unknown")
     logger.info(f"RSS Feed requested by: {ua}")
     
-    latest_articles = cache.get_latest_articles(100)
+    latest_articles = cache.get_latest_articles(500)
     rss_items = []
     
     # Try to determine current base URL for the 'self' link
