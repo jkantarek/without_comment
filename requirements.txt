@@ -3,9 +3,9 @@ uvicorn
 feedparser
 rfeed
 httpx
-pyyaml
 playwright
 readability-lxml
 lxml_html_clean
 beautifulsoup4
 python-multipart
+archiveis

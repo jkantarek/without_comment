@@ -9,6 +9,7 @@ cache.db
 cache.db-journal
 deps/
 temp_mcp_searxng/
+*.log
 
 # Environment
 .env

@@ -1,9 +1,0 @@
-# Global ignore list applied to all feeds
-ignore_domains:
-  - "example.com"
-  - "ads.google.com"
-
-feeds:
-  - url: "https://news.ycombinator.com/rss"
-    ignore_domains:
-      - "ycombinator.com"

@@ -5,17 +5,16 @@
 #   "feedparser",
 #   "rfeed",
 #   "httpx",
-#   "pyyaml",
 #   "playwright",
 #   "readability-lxml",
 #   "lxml_html_clean",
 #   "beautifulsoup4",
-#   "python-multipart"
+#   "python-multipart",
+#   "archiveis"
 # ]
 # ///
 
 import asyncio
-import yaml
 import feedparser
 import datetime
 import os
@@ -35,6 +34,7 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from playwright.async_api import async_playwright, Browser
 from readability import Document
 from bs4 import BeautifulSoup
+from archive_manager import ArchiveManager
 
 import rfeed
 
@@ -188,6 +188,12 @@ class FeedCache:
                     domain TEXT PRIMARY KEY
                 )
             """)
+            # Archive Domains table
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS archive_domains (
+                    domain TEXT PRIMARY KEY
+                )
+            """)
             conn.commit()
 
     def get_article(self, guid):
@@ -311,25 +317,28 @@ class FeedCache:
             cursor = conn.execute("SELECT domain FROM global_ignores")
             return [row[0] for row in cursor.fetchall()]
 
+    def add_archive_domain(self, domain):
+        with self._get_conn() as conn:
+            conn.execute("INSERT OR IGNORE INTO archive_domains (domain) VALUES (?)", (domain,))
+            conn.commit()
+
+    def delete_archive_domain(self, domain):
+        with self._get_conn() as conn:
+            conn.execute("DELETE FROM archive_domains WHERE domain = ?", (domain,))
+            conn.commit()
+
+    def get_archive_domains(self) -> List[str]:
+        with self._get_conn() as conn:
+            cursor = conn.execute("SELECT domain FROM archive_domains")
+            return [row[0] for row in cursor.fetchall()]
+
 cache = FeedCache(DB_PATH)
 last_refresh_time = None
-
-def sync_config_to_db():
-    if not os.path.exists("config.yaml"): return
-    try:
-        with open("config.yaml", "r") as f:
-            cfg = yaml.safe_load(f)
-            for domain in cfg.get("ignore_domains", []): cache.add_global_ignore(domain)
-            for f_entry in cfg.get("feeds", []):
-                if isinstance(f_entry, str): cache.add_feed(f_entry)
-                elif isinstance(f_entry, dict) and 'url' in f_entry:
-                    cache.add_feed(f_entry['url'], f_entry.get('ignore_domains', []))
-        logger.info("Synced config.yaml to SQLite.")
-    except Exception as e: logger.error(f"Sync error: {e}")
 
 browser_instance: Optional[Browser] = None
 playwright_manager = None
 hydration_semaphore = asyncio.Semaphore(5)
+archive_manager = ArchiveManager()
 
 REPO_HANDLERS = {
     "github.com": {"selector": "article.markdown-body", "wait_for": "article.markdown-body"},
@@ -470,7 +479,6 @@ async def background_refresh_task():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global browser_instance, playwright_manager
-    sync_config_to_db()
     cache.backfill_feed_urls()
     playwright_manager = await async_playwright().start()
     browser_instance = await playwright_manager.firefox.launch(headless=True)
@@ -512,6 +520,14 @@ async def hydrate_article(url: str) -> Optional[str]:
     async with hydration_semaphore:
         page = None
         try:
+            # Check if we should use an archive.is link
+            archive_domains = cache.get_archive_domains()
+            if archive_manager.should_archive(url, archive_domains):
+                archived_url = await archive_manager.get_archived_url(url)
+                if archived_url != url:
+                    logger.info(f"Using archived URL for hydration: {archived_url} (was {url})")
+                    url = archived_url
+
             domain = urlparse(url).netloc.lower()
             if domain.startswith("www."): domain = domain[4:]
             logger.info(f"Hydrating: {url} (Domain: {domain})")
@@ -624,6 +640,7 @@ async def get_rss(request: Request, username: Optional[str] = Depends(get_feed_u
 async def admin_page(username: str = Depends(get_current_user)):
     feeds = cache.get_feeds_with_stats()
     ignores = cache.get_global_ignores()
+    archive_domains = cache.get_archive_domains()
     stats = cache.get_stats()
     
     refresh_str = last_refresh_time.strftime("%Y-%m-%d %H:%M:%S") if last_refresh_time else "Never"
@@ -688,6 +705,16 @@ async def admin_page(username: str = Depends(get_current_user)):
             </form>
         </li>
     """ for domain in ignores])
+
+    archive_rows = "".join([f"""
+        <li class="list-group-item d-flex justify-content-between align-items-center">
+            {domain}
+            <form action="/admin/delete-archive-domain" method="post" style="display:inline">
+                <input type="hidden" name="domain" value="{domain}">
+                <button type="submit" class="btn btn-sm btn-outline-danger">x</button>
+            </form>
+        </li>
+    """ for domain in archive_domains])
 
     html = f"""
     <!DOCTYPE html>
@@ -762,7 +789,7 @@ async def admin_page(username: str = Depends(get_current_user)):
                 </div>
 
                 <div class="col-md-3">
-                    <div class="card shadow-sm">
+                    <div class="card shadow-sm mb-4">
                         <div class="card-header bg-secondary text-white">Global Ignore List</div>
                         <div class="card-body">
                             <form action="/admin/add-ignore" method="post" class="mb-3">
@@ -772,6 +799,19 @@ async def admin_page(username: str = Depends(get_current_user)):
                                 </div>
                             </form>
                             <ul class="list-group list-group-flush">{ignore_rows}</ul>
+                        </div>
+                    </div>
+
+                    <div class="card shadow-sm">
+                        <div class="card-header bg-info text-white">Archive Domains</div>
+                        <div class="card-body">
+                            <form action="/admin/add-archive-domain" method="post" class="mb-3">
+                                <div class="input-group input-group-sm">
+                                    <input type="text" name="domain" class="form-control" placeholder="nytimes.com" required>
+                                    <button class="btn btn-outline-primary" type="submit">Add</button>
+                                </div>
+                            </form>
+                            <ul class="list-group list-group-flush">{archive_rows}</ul>
                         </div>
                     </div>
                 </div>
@@ -808,6 +848,19 @@ async def admin_add_ignore(domain: str = Form(...), username: str = Depends(get_
 @app.post("/admin/delete-ignore")
 async def admin_delete_ignore(domain: str = Form(...), username: str = Depends(get_current_user)):
     cache.delete_global_ignore(domain)
+    return RedirectResponse(url="/admin", status_code=303)
+
+@app.post("/admin/add-archive-domain")
+async def admin_add_archive_domain(domain: str = Form(...), username: str = Depends(get_current_user)):
+    cache.add_archive_domain(domain)
+    return RedirectResponse(url="/admin", status_code=303)
+
+@app.post("/admin/delete-archive-domain")
+
+async def admin_delete_archive_domain(domain: str = Form(...), username: str = Depends(get_current_user)):
+
+    cache.delete_archive_domain(domain)
+
     return RedirectResponse(url="/admin", status_code=303)
 
 if __name__ == "__main__":
