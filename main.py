@@ -332,6 +332,49 @@ class FeedCache:
             cursor = conn.execute("SELECT domain FROM archive_domains")
             return [row[0] for row in cursor.fetchall()]
 
+    def get_feed_item_metrics(self):
+        with self._get_conn() as conn:
+            conn.row_factory = sqlite3.Row
+            # We'll extract domain from the link using SQL or post-process.
+            # Post-processing is easier for complex domain extraction.
+            cursor = conn.execute("""
+                SELECT 
+                    link,
+                    MAX(created_at) as last_updated,
+                    guid,
+                    title
+                FROM articles
+                GROUP BY guid -- This is just to get all data, we aggregate in Python
+                ORDER BY last_updated DESC
+            """)
+            rows = cursor.fetchall()
+            
+            metrics = {}
+            for row in rows:
+                try:
+                    domain = urlparse(row['link']).netloc
+                    if domain.startswith("www."): domain = domain[4:]
+                    if not domain: continue
+                    
+                    if domain not in metrics:
+                        metrics[domain] = {
+                            "domain": domain,
+                            "count": 0,
+                            "last_updated": row['last_updated'],
+                            "last_guid": row['guid'],
+                            "last_title": row['title']
+                        }
+                    
+                    metrics[domain]["count"] += 1
+                    if row['last_updated'] > metrics[domain]["last_updated"]:
+                        metrics[domain]["last_updated"] = row['last_updated']
+                        metrics[domain]["last_guid"] = row['guid']
+                        metrics[domain]["last_title"] = row['title']
+                except:
+                    continue
+            
+            return sorted(metrics.values(), key=lambda x: x['last_updated'], reverse=True)
+
 cache = FeedCache(DB_PATH)
 last_refresh_time = None
 
@@ -642,6 +685,7 @@ async def admin_page(username: str = Depends(get_current_user)):
     ignores = cache.get_global_ignores()
     archive_domains = cache.get_archive_domains()
     stats = cache.get_stats()
+    metrics = cache.get_feed_item_metrics()
     
     refresh_str = last_refresh_time.strftime("%Y-%m-%d %H:%M:%S") if last_refresh_time else "Never"
     
@@ -716,6 +760,20 @@ async def admin_page(username: str = Depends(get_current_user)):
         </li>
     """ for domain in archive_domains])
 
+    metric_rows = "".join([f"""
+        <tr>
+            <td>
+                <strong>{m['domain']}</strong>
+            </td>
+            <td class="text-center">{m['count']}</td>
+            <td>{m['last_updated']}</td>
+            <td>
+                <a href="/admin/preview/{m['last_guid']}" class="btn btn-sm btn-outline-info" target="_blank">Preview</a>
+                <small class="text-muted d-block text-truncate" style="max-width: 200px;">{m['last_title']}</small>
+            </td>
+        </tr>
+    """ for m in metrics])
+
     html = f"""
     <!DOCTYPE html>
     <html>
@@ -735,88 +793,123 @@ async def admin_page(username: str = Depends(get_current_user)):
             
             {stats_html}
             
-            <div class="row">
-                <div class="col-md-9">
-                    <div class="card mb-4 shadow-sm">
-                        <div class="card-header bg-primary text-white">Add New Feed</div>
-                        <div class="card-body">
-                            <form action="/admin/add-feed" method="post">
-                                <div class="row">
-                                    <div class="col-md-7">
-                                        <input type="url" name="url" class="form-control" placeholder="https://example.com/rss" required>
-                                    </div>
-                                    <div class="col-md-3">
-                                        <input type="text" name="ignores" class="form-control" placeholder="ads.com, track.it">
-                                    </div>
-                                    <div class="col-md-2">
-                                        <button type="submit" class="btn btn-primary w-100">Add</button>
-                                    </div>
-                                </div>
-                            </form>
-                        </div>
-                    </div>
+            <ul class="nav nav-tabs mb-4" id="adminTabs" role="tablist">
+                <li class="nav-item" role="presentation">
+                    <button class="nav-link active" id="feeds-tab" data-bs-toggle="tab" data-bs-target="#feeds" type="button" role="tab" aria-controls="feeds" aria-selected="true">Management</button>
+                </li>
+                <li class="nav-item" role="presentation">
+                    <button class="nav-link" id="metrics-tab" data-bs-toggle="tab" data-bs-target="#metrics" type="button" role="tab" aria-controls="metrics" aria-selected="false">Feed Item Metrics</button>
+                </li>
+            </ul>
 
-                    <div class="card shadow-sm mb-4">
-                        <div class="card-header bg-dark text-white">Active Feeds</div>
-                        <div class="card-body p-0">
-                            <table class="table table-hover mb-0 align-middle">
-                                <thead class="table-light">
-                                    <tr>
-                                        <th>Feed URL & Ignores</th>
-                                        <th class="text-center">Total</th>
-                                        <th class="text-center">Hydrated</th>
-                                        <th class="text-center">Pending</th>
-                                        <th class="text-center">Failed</th>
-                                        <th>Action</th>
-                                    </tr>
-                                </thead>
-                                <tbody>{feed_rows}</tbody>
-                            </table>
-                        </div>
-                    </div>
-
-                    <div class="card mb-4 shadow-sm">
-                        <div class="card-header bg-success text-white">Bulk Import Feeds</div>
-                        <div class="card-body">
-                            <form action="/admin/bulk-import" method="post">
-                                <div class="mb-3">
-                                    <textarea name="urls" class="form-control" rows="3" placeholder="https://site1.com/rss&#10;https://site2.com/feed" required></textarea>
+            <div class="tab-content" id="adminTabsContent">
+                <div class="tab-pane fade show active" id="feeds" role="tabpanel" aria-labelledby="feeds-tab">
+                    <div class="row">
+                        <div class="col-md-9">
+                            <div class="card mb-4 shadow-sm">
+                                <div class="card-header bg-primary text-white">Add New Feed</div>
+                                <div class="card-body">
+                                    <form action="/admin/add-feed" method="post">
+                                        <div class="row">
+                                            <div class="col-md-7">
+                                                <input type="url" name="url" class="form-control" placeholder="https://example.com/rss" required>
+                                            </div>
+                                            <div class="col-md-3">
+                                                <input type="text" name="ignores" class="form-control" placeholder="ads.com, track.it">
+                                            </div>
+                                            <div class="col-md-2">
+                                                <button type="submit" class="btn btn-primary w-100">Add</button>
+                                            </div>
+                                        </div>
+                                    </form>
                                 </div>
-                                <button type="submit" class="btn btn-success btn-sm">Bulk Add</button>
-                            </form>
+                            </div>
+
+                            <div class="card shadow-sm mb-4">
+                                <div class="card-header bg-dark text-white">Active Feeds</div>
+                                <div class="card-body p-0">
+                                    <table class="table table-hover mb-0 align-middle">
+                                        <thead class="table-light">
+                                            <tr>
+                                                <th>Feed URL & Ignores</th>
+                                                <th class="text-center">Total</th>
+                                                <th class="text-center">Hydrated</th>
+                                                <th class="text-center">Pending</th>
+                                                <th class="text-center">Failed</th>
+                                                <th>Action</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody>{feed_rows}</tbody>
+                                    </table>
+                                </div>
+                            </div>
+
+                            <div class="card mb-4 shadow-sm">
+                                <div class="card-header bg-success text-white">Bulk Import Feeds</div>
+                                <div class="card-body">
+                                    <form action="/admin/bulk-import" method="post">
+                                        <div class="mb-3">
+                                            <textarea name="urls" class="form-control" rows="3" placeholder="https://site1.com/rss&#10;https://site2.com/feed" required></textarea>
+                                        </div>
+                                        <button type="submit" class="btn btn-success btn-sm">Bulk Add</button>
+                                    </form>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="col-md-3">
+                            <div class="card shadow-sm mb-4">
+                                <div class="card-header bg-secondary text-white">Global Ignore List</div>
+                                <div class="card-body">
+                                    <form action="/admin/add-ignore" method="post" class="mb-3">
+                                        <div class="input-group input-group-sm">
+                                            <input type="text" name="domain" class="form-control" placeholder="example.com" required>
+                                            <button class="btn btn-outline-primary" type="submit">Add</button>
+                                        </div>
+                                    </form>
+                                    <ul class="list-group list-group-flush">{ignore_rows}</ul>
+                                </div>
+                            </div>
+
+                            <div class="card shadow-sm">
+                                <div class="card-header bg-info text-white">Archive Domains</div>
+                                <div class="card-body">
+                                    <form action="/admin/add-archive-domain" method="post" class="mb-3">
+                                        <div class="input-group input-group-sm">
+                                            <input type="text" name="domain" class="form-control" placeholder="nytimes.com" required>
+                                            <button class="btn btn-outline-primary" type="submit">Add</button>
+                                        </div>
+                                    </form>
+                                    <ul class="list-group list-group-flush">{archive_rows}</ul>
+                                </div>
+                            </div>
                         </div>
                     </div>
                 </div>
-
-                <div class="col-md-3">
-                    <div class="card shadow-sm mb-4">
-                        <div class="card-header bg-secondary text-white">Global Ignore List</div>
-                        <div class="card-body">
-                            <form action="/admin/add-ignore" method="post" class="mb-3">
-                                <div class="input-group input-group-sm">
-                                    <input type="text" name="domain" class="form-control" placeholder="example.com" required>
-                                    <button class="btn btn-outline-primary" type="submit">Add</button>
-                                </div>
-                            </form>
-                            <ul class="list-group list-group-flush">{ignore_rows}</ul>
-                        </div>
-                    </div>
-
+                
+                <div class="tab-pane fade" id="metrics" role="tabpanel" aria-labelledby="metrics-tab">
                     <div class="card shadow-sm">
-                        <div class="card-header bg-info text-white">Archive Domains</div>
-                        <div class="card-body">
-                            <form action="/admin/add-archive-domain" method="post" class="mb-3">
-                                <div class="input-group input-group-sm">
-                                    <input type="text" name="domain" class="form-control" placeholder="nytimes.com" required>
-                                    <button class="btn btn-outline-primary" type="submit">Add</button>
-                                </div>
-                            </form>
-                            <ul class="list-group list-group-flush">{archive_rows}</ul>
+                        <div class="card-header bg-secondary text-white">Feed Item Metrics (Aggregated by Domain)</div>
+                        <div class="card-body p-0">
+                            <table class="table table-striped table-hover mb-0">
+                                <thead class="table-dark">
+                                    <tr>
+                                        <th>Domain</th>
+                                        <th class="text-center">Article Count</th>
+                                        <th>Last Updated</th>
+                                        <th>Latest Item</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {metric_rows}
+                                </tbody>
+                            </table>
                         </div>
                     </div>
                 </div>
             </div>
         </div>
+        <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
     </body>
     </html>
     """
@@ -856,12 +949,49 @@ async def admin_add_archive_domain(domain: str = Form(...), username: str = Depe
     return RedirectResponse(url="/admin", status_code=303)
 
 @app.post("/admin/delete-archive-domain")
-
 async def admin_delete_archive_domain(domain: str = Form(...), username: str = Depends(get_current_user)):
-
     cache.delete_archive_domain(domain)
-
     return RedirectResponse(url="/admin", status_code=303)
+
+@app.get("/admin/preview/{guid}", response_class=HTMLResponse)
+async def admin_preview(guid: str, username: str = Depends(get_current_user)):
+    art = cache.get_article(guid)
+    if not art:
+        raise HTTPException(status_code=404, detail="Article not found")
+    
+    # SQLite row to dict or handle by index
+    # guid, link, title, description, source_title, feed_url, pub_date, hydrated, created_at
+    title = art[2]
+    content = art[3]
+    link = art[1]
+    
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Preview: {title}</title>
+        <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    </head>
+    <body class="bg-light">
+        <div class="container py-5">
+            <div class="mb-4">
+                <a href="/admin" class="btn btn-outline-secondary">&larr; Back to Admin</a>
+                <a href="{link}" class="btn btn-outline-primary" target="_blank">Original Link</a>
+            </div>
+            <div class="card shadow-sm">
+                <div class="card-body">
+                    <h1 class="mb-4">{title}</h1>
+                    <hr>
+                    <div class="article-content">
+                        {content}
+                    </div>
+                </div>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+    return html
 
 if __name__ == "__main__":
     import uvicorn
