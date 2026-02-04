@@ -680,7 +680,7 @@ async def get_rss(request: Request, username: Optional[str] = Depends(get_feed_u
 
 # Admin UI and Management
 @app.get("/admin", response_class=HTMLResponse)
-async def admin_page(username: str = Depends(get_current_user)):
+async def admin_page(tab: str = "management", username: str = Depends(get_current_user)):
     feeds = cache.get_feeds_with_stats()
     ignores = cache.get_global_ignores()
     archive_domains = cache.get_archive_domains()
@@ -689,6 +689,12 @@ async def admin_page(username: str = Depends(get_current_user)):
     
     refresh_str = last_refresh_time.strftime("%Y-%m-%d %H:%M:%S") if last_refresh_time else "Never"
     
+    # Tab activation logic
+    mgmt_active = "active" if tab == "management" else ""
+    metrics_active = "active" if tab == "metrics" else ""
+    mgmt_show = "show active" if tab == "management" else ""
+    metrics_show = "show active" if tab == "metrics" else ""
+
     stats_html = f"""
     <div class="row mb-4">
         <div class="col-md-3">
@@ -732,7 +738,7 @@ async def admin_page(username: str = Depends(get_current_user)):
             <td class="text-center"><span class="badge bg-warning text-dark">{f['pending_count'] or 0}</span></td>
             <td class="text-center"><span class="badge bg-danger">{f['failed_count'] or 0}</span></td>
             <td>
-                <form action="/admin/delete-feed" method="post" style="display:inline">
+                <form action="/admin/delete-feed?tab=management" method="post" style="display:inline">
                     <input type="hidden" name="url" value="{f['url']}">
                     <button type="submit" class="btn btn-sm btn-outline-danger">Delete</button>
                 </form>
@@ -743,7 +749,7 @@ async def admin_page(username: str = Depends(get_current_user)):
     ignore_rows = "".join([f"""
         <li class="list-group-item d-flex justify-content-between align-items-center">
             {domain}
-            <form action="/admin/delete-ignore" method="post" style="display:inline">
+            <form action="/admin/delete-ignore?tab=management" method="post" style="display:inline">
                 <input type="hidden" name="domain" value="{domain}">
                 <button type="submit" class="btn btn-sm btn-outline-danger">x</button>
             </form>
@@ -753,7 +759,7 @@ async def admin_page(username: str = Depends(get_current_user)):
     archive_rows = "".join([f"""
         <li class="list-group-item d-flex justify-content-between align-items-center">
             {domain}
-            <form action="/admin/delete-archive-domain" method="post" style="display:inline">
+            <form action="/admin/delete-archive-domain?tab=management" method="post" style="display:inline">
                 <input type="hidden" name="domain" value="{domain}">
                 <button type="submit" class="btn btn-sm btn-outline-danger">x</button>
             </form>
@@ -793,23 +799,23 @@ async def admin_page(username: str = Depends(get_current_user)):
             
             {stats_html}
             
-            <ul class="nav nav-tabs mb-4" id="adminTabs" role="tablist">
-                <li class="nav-item" role="presentation">
-                    <button class="nav-link active" id="feeds-tab" data-bs-toggle="tab" data-bs-target="#feeds" type="button" role="tab" aria-controls="feeds" aria-selected="true">Management</button>
+            <ul class="nav nav-tabs mb-4" id="adminTabs">
+                <li class="nav-item">
+                    <a class="nav-link {mgmt_active}" href="/admin?tab=management">Management</a>
                 </li>
-                <li class="nav-item" role="presentation">
-                    <button class="nav-link" id="metrics-tab" data-bs-toggle="tab" data-bs-target="#metrics" type="button" role="tab" aria-controls="metrics" aria-selected="false">Feed Item Metrics</button>
+                <li class="nav-item">
+                    <a class="nav-link {metrics_active}" href="/admin?tab=metrics">Feed Item Metrics</a>
                 </li>
             </ul>
 
-            <div class="tab-content" id="adminTabsContent">
-                <div class="tab-pane fade show active" id="feeds" role="tabpanel" aria-labelledby="feeds-tab">
+            <div class="tab-content">
+                <div class="tab-pane fade {mgmt_show}" id="feeds">
                     <div class="row">
                         <div class="col-md-9">
                             <div class="card mb-4 shadow-sm">
                                 <div class="card-header bg-primary text-white">Add New Feed</div>
                                 <div class="card-body">
-                                    <form action="/admin/add-feed" method="post">
+                                    <form action="/admin/add-feed?tab=management" method="post">
                                         <div class="row">
                                             <div class="col-md-7">
                                                 <input type="url" name="url" class="form-control" placeholder="https://example.com/rss" required>
@@ -847,7 +853,7 @@ async def admin_page(username: str = Depends(get_current_user)):
                             <div class="card mb-4 shadow-sm">
                                 <div class="card-header bg-success text-white">Bulk Import Feeds</div>
                                 <div class="card-body">
-                                    <form action="/admin/bulk-import" method="post">
+                                    <form action="/admin/bulk-import?tab=management" method="post">
                                         <div class="mb-3">
                                             <textarea name="urls" class="form-control" rows="3" placeholder="https://site1.com/rss&#10;https://site2.com/feed" required></textarea>
                                         </div>
@@ -861,7 +867,7 @@ async def admin_page(username: str = Depends(get_current_user)):
                             <div class="card shadow-sm mb-4">
                                 <div class="card-header bg-secondary text-white">Global Ignore List</div>
                                 <div class="card-body">
-                                    <form action="/admin/add-ignore" method="post" class="mb-3">
+                                    <form action="/admin/add-ignore?tab=management" method="post" class="mb-3">
                                         <div class="input-group input-group-sm">
                                             <input type="text" name="domain" class="form-control" placeholder="example.com" required>
                                             <button class="btn btn-outline-primary" type="submit">Add</button>
@@ -874,7 +880,7 @@ async def admin_page(username: str = Depends(get_current_user)):
                             <div class="card shadow-sm">
                                 <div class="card-header bg-info text-white">Archive Domains</div>
                                 <div class="card-body">
-                                    <form action="/admin/add-archive-domain" method="post" class="mb-3">
+                                    <form action="/admin/add-archive-domain?tab=management" method="post" class="mb-3">
                                         <div class="input-group input-group-sm">
                                             <input type="text" name="domain" class="form-control" placeholder="nytimes.com" required>
                                             <button class="btn btn-outline-primary" type="submit">Add</button>
@@ -887,7 +893,7 @@ async def admin_page(username: str = Depends(get_current_user)):
                     </div>
                 </div>
                 
-                <div class="tab-pane fade" id="metrics" role="tabpanel" aria-labelledby="metrics-tab">
+                <div class="tab-pane fade {metrics_show}" id="metrics">
                     <div class="card shadow-sm">
                         <div class="card-header bg-secondary text-white">Feed Item Metrics (Aggregated by Domain)</div>
                         <div class="card-body p-0">
@@ -909,7 +915,6 @@ async def admin_page(username: str = Depends(get_current_user)):
                 </div>
             </div>
         </div>
-        <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
     </body>
     </html>
     """
