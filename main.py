@@ -768,7 +768,7 @@ async def admin_page(username: str = Depends(get_current_user)):
             <td class="text-center">{m['count']}</td>
             <td>{m['last_updated']}</td>
             <td>
-                <a href="/admin/preview/{m['last_guid']}" class="btn btn-sm btn-outline-info" target="_blank">Preview</a>
+                <a href="/admin/preview?guid={m['last_guid']}" class="btn btn-sm btn-outline-info" target="_blank">Preview</a>
                 <small class="text-muted d-block text-truncate" style="max-width: 200px;">{m['last_title']}</small>
             </td>
         </tr>
@@ -953,7 +953,7 @@ async def admin_delete_archive_domain(domain: str = Form(...), username: str = D
     cache.delete_archive_domain(domain)
     return RedirectResponse(url="/admin", status_code=303)
 
-@app.get("/admin/preview/{guid}", response_class=HTMLResponse)
+@app.get("/admin/preview", response_class=HTMLResponse)
 async def admin_preview(guid: str, username: str = Depends(get_current_user)):
     art = cache.get_article(guid)
     if not art:
