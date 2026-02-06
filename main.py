@@ -646,9 +646,22 @@ async def get_rss(request: Request, username: Optional[str] = Depends(get_feed_u
     feed_url = f"{base_url}/rss"
 
     for art in latest_articles:
+        link = art.get('link', '')
+        domain = "unknown"
+        if link:
+            try:
+                domain = urlparse(link).netloc
+                if domain.startswith("www."):
+                    domain = domain[4:]
+            except:
+                pass
+
+        source = art.get('source_title') or "Unknown Source"
+        new_title = f"{domain} via {source}"
+
         item = rfeed.Item(
-            title=art.get('title', 'No Title'), 
-            link=art.get('link', ''), 
+            title=new_title, 
+            link=link, 
             # We use our custom CDATA extension instead of the default description field
             # to prevent rfeed from escaping the HTML content.
             extensions=[
