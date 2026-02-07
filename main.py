@@ -657,15 +657,15 @@ async def get_rss(request: Request, username: Optional[str] = Depends(get_feed_u
                 pass
 
         source = art.get('source_title') or "Unknown Source"
-        new_title = f"{domain} via {source}"
+        creator_string = f"{domain} via {source}"
 
         item = rfeed.Item(
-            title=new_title, 
+            title=art.get('title', 'No Title'), 
             link=link, 
             # We use our custom CDATA extension instead of the default description field
             # to prevent rfeed from escaping the HTML content.
             extensions=[
-                DCCreator(art.get('source_title') or "Unknown Source"),
+                DCCreator(creator_string),
                 CDATA(art.get('description', ''))
             ],
             guid=rfeed.Guid(art.get('guid', art.get('link', ''))), 
