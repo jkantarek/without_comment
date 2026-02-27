@@ -24,7 +24,7 @@ import httpx
 import sqlite3
 import json
 import secrets
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from contextlib import asynccontextmanager
 from urllib.parse import urljoin, urlparse
 
@@ -211,6 +211,7 @@ class FeedCache:
                         feed_url = COALESCE(excluded.feed_url, articles.feed_url),
                         source_title = COALESCE(excluded.source_title, articles.source_title),
                         hydrated = CASE WHEN excluded.hydrated > articles.hydrated THEN excluded.hydrated ELSE articles.hydrated END,
+                        title = CASE WHEN excluded.hydrated > articles.hydrated THEN excluded.title ELSE articles.title END,
                         description = CASE WHEN excluded.hydrated > articles.hydrated THEN excluded.description ELSE articles.description END
                 """, (guid, link, title, description, source_title, feed_url, pub_date, hydrated))
                 conn.commit()
@@ -460,10 +461,13 @@ async def hydrate_and_save(article):
     guid = article['guid']
     url = article['link']
     try:
-        content = await hydrate_article(url)
+        title, content = await hydrate_article(url)
+        # Use extracted title if available and current title is just the URL or placeholder
+        final_title = title if title and (not article['title'] or article['title'] == url or article['title'] == "Manual Link") else article['title']
+        
         if content:
             logger.info(f"SUCCESS: Hydrated '{article['title']}' ({guid})")
-            cache.save_article(guid, url, article['title'], 
+            cache.save_article(guid, url, final_title, 
                              content, 
                              article['pub_date'], 
                              source_title=article['source_title'],
@@ -471,7 +475,7 @@ async def hydrate_and_save(article):
                              hydrated=1)
         else:
             logger.warning(f"FAILURE: Could not extract content for '{article['title']}' ({guid}). Marking as failed.")
-            cache.save_article(guid, url, article['title'], 
+            cache.save_article(guid, url, final_title, 
                              article['description'], 
                              article['pub_date'], 
                              source_title=article['source_title'],
@@ -556,10 +560,10 @@ def clean_html(html_content: str, base_url: str) -> str:
         social.decompose()
     return str(soup)
 
-async def hydrate_article(url: str) -> Optional[str]:
+async def hydrate_article(url: str) -> Tuple[Optional[str], Optional[str]]:
     if not browser_instance:
         logger.warning("Hydration skipped: Browser instance not initialized.")
-        return None
+        return None, None
     async with hydration_semaphore:
         page = None
         try:
@@ -579,6 +583,9 @@ async def hydrate_article(url: str) -> Optional[str]:
             page = await browser_instance.new_page()
             await page.set_extra_http_headers({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0"})
             await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            
+            # Use the page title as a fallback
+            page_title = await page.title()
             
             # ... evaluation script ...
             await page.evaluate("""async () => {
@@ -612,23 +619,28 @@ async def hydrate_article(url: str) -> Optional[str]:
                     if readme_html: 
                         cleaned = clean_html(readme_html, url)
                         logger.info(f"Successfully extracted content using {domain} handler ({len(cleaned)} chars)")
-                        return cleaned
+                        return page_title, cleaned
                 except Exception as e:
                     logger.warning(f"Specialized handler failed for {url}: {e}")
             
             content = await page.content()
             doc = Document(content)
             summary_html = doc.summary()
+            extracted_title = doc.title()
+            
+            # Prefer extracted_title if it looks better than page_title
+            final_title = extracted_title if extracted_title and len(extracted_title) > 5 else page_title
+
             if summary_html:
                 cleaned = clean_html(summary_html, url)
                 logger.info(f"Successfully extracted summary using readability ({len(cleaned)} chars)")
-                return cleaned
+                return final_title, cleaned
             
             logger.warning(f"No content extracted for {url}")
-            return None
+            return final_title, None
         except Exception as e:
             logger.error(f"Hydration error for {url}: {type(e).__name__}: {str(e)}")
-            return None
+            return None, None
         finally:
             if page: await page.close()
 
@@ -874,6 +886,19 @@ async def admin_page(tab: str = "management", username: str = Depends(get_curren
                                     </form>
                                 </div>
                             </div>
+
+                            <div class="card mb-4 shadow-sm">
+                                <div class="card-header bg-warning text-dark">Quick Add Individual Links</div>
+                                <div class="card-body">
+                                    <form action="/admin/add-links?tab=management" method="post">
+                                        <div class="mb-3">
+                                            <textarea name="links" class="form-control" rows="3" placeholder="https://example.com/article1&#10;https://example.com/article2" required></textarea>
+                                            <div class="form-text">Paste one or more URLs to add them to the hydration queue.</div>
+                                        </div>
+                                        <button type="submit" class="btn btn-warning btn-sm">Add to Digest</button>
+                                    </form>
+                                </div>
+                            </div>
                         </div>
 
                         <div class="col-md-3">
@@ -944,6 +969,15 @@ async def admin_bulk_import(urls: str = Form(...), username: str = Depends(get_c
     url_list = [u.strip() for u in urls.split("\n") if u.strip()]
     for url in url_list:
         cache.add_feed(url)
+    return RedirectResponse(url="/admin", status_code=303)
+
+@app.post("/admin/add-links")
+async def admin_add_links(links: str = Form(...), username: str = Depends(get_current_user)):
+    link_list = [l.strip() for l in links.split("\n") if l.strip()]
+    now = datetime.datetime.now().isoformat()
+    for link in link_list:
+        # Use link as GUID for manual entries
+        cache.save_article(link, link, "Manual Link", "", now, source_title="Manual", hydrated=0)
     return RedirectResponse(url="/admin", status_code=303)
 
 @app.post("/admin/delete-feed")
