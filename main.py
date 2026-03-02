@@ -204,7 +204,8 @@ class FeedCache:
         if days <= 0:
             raise ValueError("days must be positive")
         try:
-            cutoff = (datetime.datetime.utcnow() - datetime.timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+            cutoff_dt = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=days)
+            cutoff = cutoff_dt.strftime("%Y-%m-%d %H:%M:%S")
             with self._get_conn() as conn:
                 deleted = conn.execute(
                     "DELETE FROM articles WHERE created_at < ?",
@@ -214,7 +215,7 @@ class FeedCache:
                 if deleted:
                     logger.info(f"Purged {deleted} articles older than {days} days")
         except Exception as e:
-            logger.error(f"Purge error: {e}")
+            logger.error(f"Purge error for {days}-day retention: {e}")
 
     def get_article(self, guid):
         with self._get_conn() as conn:
