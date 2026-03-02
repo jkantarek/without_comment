@@ -205,10 +205,10 @@ class FeedCache:
             raise ValueError("Retention days must be greater than 0")
         try:
             cutoff_dt = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=days)
-            cutoff = cutoff_dt.isoformat()
+            cutoff = cutoff_dt.strftime("%Y-%m-%d %H:%M:%S")
             with self._get_conn() as conn:
                 deleted = conn.execute(
-                    "DELETE FROM articles WHERE julianday(created_at) < julianday(?)",
+                    "DELETE FROM articles WHERE datetime(created_at) < datetime(?, 'utc')",
                     (cutoff,)
                 ).rowcount
                 conn.commit()
