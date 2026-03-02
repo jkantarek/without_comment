@@ -204,11 +204,11 @@ class FeedCache:
         if days <= 0:
             raise ValueError("days must be positive")
         try:
-            datetime_modifier = f"-{days} days"
+            cutoff = (datetime.datetime.utcnow() - datetime.timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
             with self._get_conn() as conn:
                 deleted = conn.execute(
-                    "DELETE FROM articles WHERE datetime(created_at) < datetime('now', ?)",
-                    (datetime_modifier,)
+                    "DELETE FROM articles WHERE created_at < ?",
+                    (cutoff,)
                 ).rowcount
                 conn.commit()
                 if deleted:
