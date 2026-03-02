@@ -217,7 +217,7 @@ class FeedCache:
                     """
                     DELETE FROM articles WHERE 
                         (typeof(created_at) = 'integer' AND created_at < ?)
-                        OR (typeof(created_at) != 'integer' AND strftime('%s', created_at) < ?)
+                        OR (typeof(created_at) != 'integer' AND CAST(strftime('%s', created_at) AS INTEGER) < ?)
                     """,
                     (cutoff, cutoff)
                 ).rowcount
