@@ -201,12 +201,14 @@ class FeedCache:
         """Remove articles older than the configured retention window."""
         if days is None:
             days = ARTICLE_RETENTION_DAYS
+        if days <= 0:
+            raise ValueError("days must be positive")
         try:
-            modifier = f"-{days} days"
+            datetime_modifier = f"-{days} days"
             with self._get_conn() as conn:
                 deleted = conn.execute(
                     "DELETE FROM articles WHERE datetime(created_at) < datetime('now', ?)",
-                    (modifier,)
+                    (datetime_modifier,)
                 ).rowcount
                 conn.commit()
                 if deleted:
