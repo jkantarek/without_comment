@@ -205,7 +205,7 @@ class FeedCache:
                 UPDATE articles
                 SET created_at = datetime(created_at, 'unixepoch')
                 WHERE typeof(created_at) = 'integer'
-            """)
+            """)  # Normalize any legacy integer timestamps into ISO strings
             conn.commit()
 
     def purge_old_articles(self, days: Optional[int] = None):
@@ -218,6 +218,7 @@ class FeedCache:
             cutoff_dt = datetime.datetime.now(tz=datetime.timezone.utc) - datetime.timedelta(days=days)
             cutoff = int(cutoff_dt.timestamp())
             with self._get_conn() as conn:
+                # created_at is stored as an ISO datetime string; convert to epoch seconds for comparison
                 deleted = conn.execute(
                     "DELETE FROM articles WHERE CAST(strftime('%s', created_at) AS INTEGER) < ?",
                     (cutoff,)
