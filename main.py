@@ -198,13 +198,15 @@ class FeedCache:
             conn.commit()
 
     def purge_old_articles(self, days: Optional[int] = None):
+        """Remove articles older than the configured retention window."""
         if days is None:
             days = ARTICLE_RETENTION_DAYS
         try:
+            modifier = f"-{days} days"
             with self._get_conn() as conn:
                 deleted = conn.execute(
-                    "DELETE FROM articles WHERE created_at < datetime('now', ?)",
-                    (f"-{days} days",)
+                    "DELETE FROM articles WHERE datetime(created_at) < datetime('now', ?)",
+                    (modifier,)
                 ).rowcount
                 conn.commit()
                 if deleted:
