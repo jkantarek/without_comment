@@ -202,10 +202,10 @@ class FeedCache:
         if days is None:
             days = ARTICLE_RETENTION_DAYS
         if days <= 0:
-            raise ValueError("days must be positive")
+            raise ValueError("Retention days must be greater than 0")
         try:
             cutoff_dt = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=days)
-            cutoff = cutoff_dt.strftime("%Y-%m-%d %H:%M:%S")
+            cutoff = cutoff_dt.replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S")
             with self._get_conn() as conn:
                 deleted = conn.execute(
                     "DELETE FROM articles WHERE created_at < ?",
