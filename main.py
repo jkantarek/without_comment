@@ -214,8 +214,12 @@ class FeedCache:
             cutoff = int(cutoff_dt.timestamp())
             with self._get_conn() as conn:
                 deleted = conn.execute(
-                    "DELETE FROM articles WHERE strftime('%s', created_at) < ?",
-                    (cutoff,)
+                    """
+                    DELETE FROM articles WHERE 
+                        (typeof(created_at) = 'integer' AND created_at < ?)
+                        OR (typeof(created_at) != 'integer' AND strftime('%s', created_at) < ?)
+                    """,
+                    (cutoff, cutoff)
                 ).rowcount
                 conn.commit()
                 if deleted:
