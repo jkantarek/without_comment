@@ -77,7 +77,13 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 DB_PATH = os.environ.get("DB_PATH", "cache.db")
-ARTICLE_RETENTION_DAYS = 15
+def _retention_days_from_env():
+    try:
+        return int(os.environ.get("ARTICLE_RETENTION_DAYS", "15"))
+    except ValueError:
+        logger.warning("Invalid ARTICLE_RETENTION_DAYS; defaulting to 15 days.")
+        return 15
+ARTICLE_RETENTION_DAYS = _retention_days_from_env()
 security = HTTPBasic()
 
 # Auth Config
@@ -208,15 +214,7 @@ class FeedCache:
             cutoff = int(cutoff_dt.timestamp())
             with self._get_conn() as conn:
                 deleted = conn.execute(
-                    """
-                    DELETE FROM articles 
-                    WHERE (
-                        CASE 
-                            WHEN typeof(created_at) = 'integer' THEN created_at
-                            ELSE strftime('%s', created_at)
-                        END
-                    ) < ?
-                    """,
+                    "DELETE FROM articles WHERE strftime('%s', created_at) < ?",
                     (cutoff,)
                 ).rowcount
                 conn.commit()

@@ -26,6 +26,7 @@ Required for management:
 Optional for feed protection:
 - `FEED_USER`: Username to protect the `/rss` endpoint.
 - `FEED_PASS`: Password to protect the `/rss` endpoint.
+- `ARTICLE_RETENTION_DAYS`: Override the default 15-day article retention window.
 
 ### Running Locally
 
