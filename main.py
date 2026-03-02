@@ -77,6 +77,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 DB_PATH = os.environ.get("DB_PATH", "cache.db")
+ARTICLE_RETENTION_DAYS = 15
 security = HTTPBasic()
 
 # Auth Config
@@ -195,6 +196,19 @@ class FeedCache:
                 )
             """)
             conn.commit()
+
+    def purge_old_articles(self, days: int = ARTICLE_RETENTION_DAYS):
+        try:
+            with self._get_conn() as conn:
+                deleted = conn.execute(
+                    "DELETE FROM articles WHERE created_at < datetime('now', ?)",
+                    (f"-{days} days",)
+                ).rowcount
+                conn.commit()
+                if deleted:
+                    logger.info(f"Purged {deleted} articles older than {days} days")
+        except Exception as e:
+            logger.error(f"Purge error: {e}")
 
     def get_article(self, guid):
         with self._get_conn() as conn:
@@ -495,6 +509,7 @@ async def background_refresh_task():
     while True:
         try:
             logger.info("Starting background refresh cycle...")
+            cache.purge_old_articles(ARTICLE_RETENTION_DAYS)
             feeds = cache.get_feeds()
             global_ignores = cache.get_global_ignores()
             
