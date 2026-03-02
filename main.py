@@ -197,7 +197,9 @@ class FeedCache:
             """)
             conn.commit()
 
-    def purge_old_articles(self, days: int = ARTICLE_RETENTION_DAYS):
+    def purge_old_articles(self, days: Optional[int] = None):
+        if days is None:
+            days = ARTICLE_RETENTION_DAYS
         try:
             with self._get_conn() as conn:
                 deleted = conn.execute(
@@ -509,7 +511,7 @@ async def background_refresh_task():
     while True:
         try:
             logger.info("Starting background refresh cycle...")
-            cache.purge_old_articles(ARTICLE_RETENTION_DAYS)
+            cache.purge_old_articles()
             feeds = cache.get_feeds()
             global_ignores = cache.get_global_ignores()
             
