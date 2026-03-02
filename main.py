@@ -201,6 +201,11 @@ class FeedCache:
                     domain TEXT PRIMARY KEY
                 )
             """)
+            conn.execute("""
+                UPDATE articles
+                SET created_at = datetime(created_at, 'unixepoch')
+                WHERE typeof(created_at) = 'integer'
+            """)
             conn.commit()
 
     def purge_old_articles(self, days: Optional[int] = None):
@@ -214,18 +219,16 @@ class FeedCache:
             cutoff = int(cutoff_dt.timestamp())
             with self._get_conn() as conn:
                 deleted = conn.execute(
-                    """
-                    DELETE FROM articles WHERE 
-                        (typeof(created_at) = 'integer' AND created_at < ?)
-                        OR (typeof(created_at) != 'integer' AND CAST(strftime('%s', created_at) AS INTEGER) < ?)
-                    """,
-                    (cutoff, cutoff)
+                    "DELETE FROM articles WHERE CAST(strftime('%s', created_at) AS INTEGER) < ?",
+                    (cutoff,)
                 ).rowcount
                 conn.commit()
                 if deleted:
                     logger.info(f"Purged {deleted} articles older than {days} days")
+        except sqlite3.Error as e:
+            logger.error(f"Database purge error for {days}-day retention: {e}")
         except Exception as e:
-            logger.error(f"Purge error for {days}-day retention: {e}")
+            logger.error(f"Unexpected purge error for {days}-day retention: {e}")
 
     def get_article(self, guid):
         with self._get_conn() as conn:
