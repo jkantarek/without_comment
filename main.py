@@ -204,7 +204,7 @@ class FeedCache:
         if days <= 0:
             raise ValueError(f"Retention days must be greater than 0, got {days}")
         try:
-            cutoff_dt = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=days)
+            cutoff_dt = datetime.datetime.now(tz=datetime.timezone.utc) - datetime.timedelta(days=days)
             cutoff = int(cutoff_dt.timestamp())
             with self._get_conn() as conn:
                 deleted = conn.execute(
