@@ -174,6 +174,9 @@ class FeedCache:
             try:
                 conn.execute("ALTER TABLE articles ADD COLUMN feed_url TEXT")
             except sqlite3.OperationalError: pass
+            try:
+                conn.execute("ALTER TABLE articles ADD COLUMN retry_count INTEGER DEFAULT 0")
+            except sqlite3.OperationalError: pass
 
             # Feeds table
             conn.execute("""
@@ -210,9 +213,20 @@ class FeedCache:
                     ON CONFLICT(guid) DO UPDATE SET
                         feed_url = COALESCE(excluded.feed_url, articles.feed_url),
                         source_title = COALESCE(excluded.source_title, articles.source_title),
-                        hydrated = CASE WHEN excluded.hydrated > articles.hydrated THEN excluded.hydrated ELSE articles.hydrated END,
-                        title = CASE WHEN excluded.hydrated > articles.hydrated THEN excluded.title ELSE articles.title END,
-                        description = CASE WHEN excluded.hydrated > articles.hydrated THEN excluded.description ELSE articles.description END
+                        hydrated = CASE
+                            WHEN articles.hydrated = 1 THEN 1
+                            WHEN excluded.hydrated = 1 THEN 1
+                            WHEN excluded.hydrated = 2 THEN 2
+                            ELSE articles.hydrated
+                        END,
+                        title = CASE
+                            WHEN articles.hydrated != 1 AND excluded.hydrated = 1 THEN excluded.title
+                            ELSE articles.title
+                        END,
+                        description = CASE
+                            WHEN articles.hydrated != 1 AND excluded.hydrated = 1 THEN excluded.description
+                            ELSE articles.description
+                        END
                 """, (guid, link, title, description, source_title, feed_url, pub_date, hydrated))
                 conn.commit()
         except Exception as e:
@@ -241,9 +255,17 @@ class FeedCache:
             cursor = conn.execute("SELECT * FROM articles WHERE hydrated = 1 ORDER BY pub_date DESC LIMIT ?", (limit,))
             return [dict(row) for row in cursor.fetchall()]
 
+    def mark_as_retrying(self, guid):
+        with self._get_conn() as conn:
+            conn.execute(
+                "UPDATE articles SET hydrated=3, retry_count=retry_count+1 WHERE guid=?",
+                (guid,)
+            )
+            conn.commit()
+
     def get_unhydrated_count(self):
         with self._get_conn() as conn:
-            cursor = conn.execute("SELECT COUNT(*) FROM articles WHERE hydrated = 0")
+            cursor = conn.execute("SELECT COUNT(*) FROM articles WHERE hydrated IN (0, 3)")
             return cursor.fetchone()[0]
 
     def get_stats(self):
@@ -253,7 +275,8 @@ class FeedCache:
                     COUNT(*) as total,
                     SUM(CASE WHEN hydrated = 1 THEN 1 ELSE 0 END) as hydrated,
                     SUM(CASE WHEN hydrated = 0 THEN 1 ELSE 0 END) as pending,
-                    SUM(CASE WHEN hydrated = 2 THEN 1 ELSE 0 END) as failed
+                    SUM(CASE WHEN hydrated = 2 THEN 1 ELSE 0 END) as failed,
+                    SUM(CASE WHEN hydrated = 3 THEN 1 ELSE 0 END) as retrying
                 FROM articles
             """)
             row = cursor.fetchone()
@@ -261,13 +284,14 @@ class FeedCache:
                 "total": row[0] or 0,
                 "hydrated": row[1] or 0,
                 "pending": row[2] or 0,
-                "failed": row[3] or 0
+                "failed": row[3] or 0,
+                "retrying": row[4] or 0
             }
 
     def get_unhydrated(self, limit=50):
         with self._get_conn() as conn:
             conn.row_factory = sqlite3.Row
-            cursor = conn.execute("SELECT * FROM articles WHERE hydrated = 0 ORDER BY pub_date DESC LIMIT ?", (limit,))
+            cursor = conn.execute("SELECT * FROM articles WHERE hydrated IN (0, 3) ORDER BY pub_date DESC LIMIT ?", (limit,))
             return [dict(row) for row in cursor.fetchall()]
 
     def add_feed(self, url, ignore_domains: List[str] = None):
@@ -378,6 +402,7 @@ class FeedCache:
 
 cache = FeedCache(DB_PATH)
 last_refresh_time = None
+refresh_task: Optional[asyncio.Task] = None
 
 browser_instance: Optional[Browser] = None
 playwright_manager = None
@@ -457,6 +482,8 @@ async def refresh_feed(f, global_ignores):
     except Exception as e:
         logger.error(f"Error refreshing feed {url}: {e}")
 
+ARCHIVE_MAX_RETRIES = 5
+
 async def hydrate_and_save(article):
     guid = article['guid']
     url = article['link']
@@ -474,21 +501,33 @@ async def hydrate_and_save(article):
                              feed_url=article.get('feed_url'),
                              hydrated=1)
         else:
-            logger.warning(f"FAILURE: Could not extract content for '{article['title']}' ({guid}). Marking as failed.")
-            cache.save_article(guid, url, final_title, 
+            archive_domains = cache.get_archive_domains()
+            retry_count = article.get('retry_count', 0)
+            if archive_manager.should_archive(url, archive_domains) and retry_count < ARCHIVE_MAX_RETRIES:
+                logger.warning(f"ARCHIVE RETRY {retry_count + 1}/{ARCHIVE_MAX_RETRIES}: Not ready yet for '{article['title']}' ({guid}).")
+                cache.mark_as_retrying(guid)
+            else:
+                logger.warning(f"FAILURE: Could not extract content for '{article['title']}' ({guid}). Marking as failed.")
+                cache.save_article(guid, url, final_title, 
+                                 article['description'], 
+                                 article['pub_date'], 
+                                 source_title=article['source_title'],
+                                 feed_url=article.get('feed_url'),
+                                 hydrated=2)
+    except Exception as e:
+        archive_domains = cache.get_archive_domains()
+        retry_count = article.get('retry_count', 0)
+        if archive_manager.should_archive(url, archive_domains) and retry_count < ARCHIVE_MAX_RETRIES:
+            logger.error(f"ARCHIVE RETRY {retry_count + 1}/{ARCHIVE_MAX_RETRIES}: Exception for '{article['title']}' ({guid}): {e}")
+            cache.mark_as_retrying(guid)
+        else:
+            logger.error(f"CRITICAL FAILURE: Error during hydration task for '{article['title']}' ({guid}): {e}")
+            cache.save_article(guid, url, article['title'], 
                              article['description'], 
                              article['pub_date'], 
                              source_title=article['source_title'],
                              feed_url=article.get('feed_url'),
                              hydrated=2)
-    except Exception as e:
-        logger.error(f"CRITICAL FAILURE: Error during hydration task for '{article['title']}' ({guid}): {e}")
-        cache.save_article(guid, url, article['title'], 
-                         article['description'], 
-                         article['pub_date'], 
-                         source_title=article['source_title'],
-                         feed_url=article.get('feed_url'),
-                         hydrated=2)
 
 async def background_refresh_task():
     global last_refresh_time
@@ -525,7 +564,7 @@ async def background_refresh_task():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global browser_instance, playwright_manager
+    global browser_instance, playwright_manager, refresh_task
     cache.backfill_feed_urls()
     playwright_manager = await async_playwright().start()
     browser_instance = await playwright_manager.firefox.launch(headless=True)
@@ -722,33 +761,42 @@ async def admin_page(tab: str = "management", username: str = Depends(get_curren
 
     stats_html = f"""
     <div class="row mb-4">
-        <div class="col-md-3">
+        <div class="col">
             <div class="card bg-primary text-white text-center p-3 shadow-sm">
                 <div class="h4 mb-0">{stats['total']}</div>
                 <small>Total Articles</small>
             </div>
         </div>
-        <div class="col-md-3">
+        <div class="col">
             <div class="card bg-success text-white text-center p-3 shadow-sm">
                 <div class="h4 mb-0">{stats['hydrated']}</div>
                 <small>Hydrated</small>
             </div>
         </div>
-        <div class="col-md-3">
+        <div class="col">
             <div class="card bg-warning text-dark text-center p-3 shadow-sm">
                 <div class="h4 mb-0">{stats['pending']}</div>
-                <small>Pending Hydration Queue</small>
+                <small>Pending</small>
             </div>
         </div>
-        <div class="col-md-3">
+        <div class="col">
+            <div class="card bg-info text-white text-center p-3 shadow-sm">
+                <div class="h4 mb-0">{stats['retrying']}</div>
+                <small>Retrying (archive.is)</small>
+            </div>
+        </div>
+        <div class="col">
             <div class="card bg-danger text-white text-center p-3 shadow-sm">
                 <div class="h4 mb-0">{stats['failed']}</div>
                 <small>Failed</small>
             </div>
         </div>
     </div>
-    <div class="alert alert-info py-2 shadow-sm">
-        <strong>Last Background Refresh:</strong> {refresh_str} (Interval: 10m)
+    <div class="alert alert-info py-2 shadow-sm d-flex justify-content-between align-items-center">
+        <span><strong>Last Background Refresh:</strong> {refresh_str} (Interval: 10m)</span>
+        <form action="/admin/force-refresh" method="post" style="margin:0">
+            <button type="submit" class="btn btn-sm btn-warning">Force Refresh</button>
+        </form>
     </div>
     """
     
@@ -1003,6 +1051,19 @@ async def admin_add_archive_domain(domain: str = Form(...), username: str = Depe
 @app.post("/admin/delete-archive-domain")
 async def admin_delete_archive_domain(domain: str = Form(...), username: str = Depends(get_current_user)):
     cache.delete_archive_domain(domain)
+    return RedirectResponse(url="/admin", status_code=303)
+
+@app.post("/admin/force-refresh")
+async def admin_force_refresh(username: str = Depends(get_current_user)):
+    global refresh_task
+    if refresh_task and not refresh_task.done():
+        refresh_task.cancel()
+        try:
+            await refresh_task
+        except asyncio.CancelledError:
+            pass
+    refresh_task = asyncio.create_task(background_refresh_task())
+    logger.info("Background refresh task restarted by admin.")
     return RedirectResponse(url="/admin", status_code=303)
 
 @app.get("/admin/preview", response_class=HTMLResponse)
