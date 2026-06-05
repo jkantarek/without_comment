@@ -689,7 +689,7 @@ async def get_rss(request: Request, username: Optional[str] = Depends(get_feed_u
     ua = request.headers.get("user-agent", "Unknown")
     logger.info(f"RSS Feed requested by: {ua}")
     
-    latest_articles = cache.get_latest_articles(500)
+    latest_articles = cache.get_latest_articles(100)
     rss_items = []
     
     # Try to determine current base URL for the 'self' link
