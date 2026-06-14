@@ -35,6 +35,8 @@ from playwright.async_api import async_playwright, Browser
 from readability import Document
 from bs4 import BeautifulSoup
 from archive_manager import ArchiveManager
+from calendar_fetcher import CalendarFetcher
+from calendar_feed import CalendarFeedGenerator
 
 import rfeed
 
@@ -408,6 +410,8 @@ browser_instance: Optional[Browser] = None
 playwright_manager = None
 hydration_semaphore = asyncio.Semaphore(5)
 archive_manager = ArchiveManager()
+calendar_fetcher: Optional[CalendarFetcher] = None
+calendar_feed_gen: Optional[CalendarFeedGenerator] = None
 
 REPO_HANDLERS = {
     "github.com": {"selector": "article.markdown-body", "wait_for": "article.markdown-body"},
@@ -555,6 +559,17 @@ async def background_refresh_task():
                 # Process batch in parallel (respecting semaphore)
                 await asyncio.gather(*[hydrate_and_save(a) for a in latest_unhydrated], return_exceptions=True)
             
+            # Refresh calendar sources
+            if calendar_fetcher:
+                try:
+                    calendar_sources = calendar_fetcher.get_sources(enabled_only=True)
+                    if calendar_sources:
+                        logger.info(f"Refreshing {len(calendar_sources)} calendar source(s)...")
+                        for source in calendar_sources:
+                            await calendar_fetcher.fetch_all_lookahead(source["id"])
+                            logger.info(f"Calendar source '{source['name']}' refreshed.")
+                except Exception as ce:
+                    logger.error(f"Error refreshing calendar sources: {ce}")
             last_refresh_time = datetime.datetime.now()
             logger.info("Background refresh cycle complete.")
         except Exception as e:
@@ -564,11 +579,14 @@ async def background_refresh_task():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global browser_instance, playwright_manager, refresh_task
+    global browser_instance, playwright_manager, refresh_task, calendar_fetcher, calendar_feed_gen
     cache.backfill_feed_urls()
     playwright_manager = await async_playwright().start()
     browser_instance = await playwright_manager.firefox.launch(headless=True)
     refresh_task = asyncio.create_task(background_refresh_task())
+    # Initialize calendar fetcher
+    calendar_fetcher = CalendarFetcher(db_path=db_path)
+    calendar_feed_gen = CalendarFeedGenerator(calendar_fetcher)
     yield
     refresh_task.cancel()
     if browser_instance: await browser_instance.close()
@@ -723,6 +741,16 @@ async def get_rss(request: Request, username: Optional[str] = Depends(get_feed_u
             pubDate=datetime.datetime.fromisoformat(art['pub_date'])
         )
         rss_items.append(item)
+        
+        # Add calendar weekly digest items
+        if calendar_feed_gen:
+            try:
+                calendar_sources = calendar_fetcher.get_sources(enabled_only=True)
+                for source in calendar_sources:
+                    weekly_items = calendar_feed_gen.get_weekly_rss_items(source["id"])
+                    rss_items.extend(weekly_items)
+            except Exception as ce:
+                logger.error(f"Error generating calendar RSS items: {ce}")
     
     feed = rfeed.Feed(
         title="Unified Hydrated Feed", 
@@ -868,6 +896,7 @@ async def admin_page(tab: str = "management", username: str = Depends(get_curren
             <div class="d-flex justify-content-between align-items-center mb-4">
                 <h1>RSS Feed Management</h1>
                 <a href="/rss" class="btn btn-outline-secondary" target="_blank">View RSS Feed</a>
+                <a href="/admin/calendars" class="btn btn-outline-primary">Calendar Sources</a>
             </div>
             
             {stats_html}
@@ -1065,6 +1094,339 @@ async def admin_force_refresh(username: str = Depends(get_current_user)):
     refresh_task = asyncio.create_task(background_refresh_task())
     logger.info("Background refresh task restarted by admin.")
     return RedirectResponse(url="/admin", status_code=303)
+
+@app.get("/admin/calendars", response_class=HTMLResponse)
+async def admin_calendars(username: str = Depends(get_current_user)):
+    """View configured calendar sources."""
+    sources = calendar_fetcher.get_sources(enabled_only=False) if calendar_fetcher else []
+    
+    calendar_form = ""
+    sources = calendar_fetcher.get_sources(enabled_only=False) if calendar_fetcher else []
+    
+    # Build rows
+    rows = ""
+    for s in sources:
+        # Count months
+        months = calendar_fetcher.get_months_for_source(s["id"]) if calendar_fetcher else []
+        status_badge = "<span class='badge bg-success'>Active</span>" if s["enabled"] else "<span class='badge bg-secondary'>Disabled</span>"
+        rows += f"""
+        <tr>
+            <td><strong>{s["name"]}</strong></td>
+            <td><code>{s["base_url"]}</code></td>
+            <td><code>{s["collection_id"]}</code></td>
+            <td>{len(months)} month(s)</td>
+            <td>{status_badge}</td>
+            <td>
+                <form method="POST" action="/admin/refresh-calendar" class="d-inline">
+                    <input type="hidden" name="source_id" value="{s['id']}">
+                    <button type="submit" class="btn btn-sm btn-outline-primary">Refresh</button>
+                </form>
+                <button type="button" class="btn btn-sm btn-outline-info" data-bs-toggle="modal" data-bs-target="#mapCalendarModal{s['id']}">Mappings</button>
+                <form method="POST" action="/admin/toggle-calendar" class="d-inline">
+                    <input type="hidden" name="source_id" value="{s['id']}">
+                    <button type="submit" class="btn btn-sm btn-outline-secondary">{"Disable" if s["enabled"] else "Enable"}</button>
+                </form>
+                <form method="POST" action="/admin/delete-calendar" class="d-inline">
+                    <input type="hidden" name="source_id" value="{s['id']}">
+                    <button type="submit" class="btn btn-sm btn-outline-danger">Delete</button>
+                </form>
+            </td>
+        </tr>
+        """
+    # Generate field mapping modals for each source
+    mapping_modals = ""
+    for s in sources:
+        mappings = calendar_fetcher.get_field_mappings(s["id"])
+        mapping_rows = ""
+        for m in mappings:
+            mapping_rows += f"""
+            <tr>
+                <td>{m['internal_field']}</td>
+                <td><code>{m['json_path']}</code></td>
+                <td>{m['transform']}</td>
+                <td>
+                    <form method="POST" action="/admin/delete-calendar-field">
+                        <input type="hidden" name="source_id" value="{s['id']}">
+                        <input type="hidden" name="internal_field" value="{m['internal_field']}">
+                        <button type="submit" class="btn btn-sm btn-outline-danger">×</button>
+                    </form>
+                </td>
+            </tr>
+            """
+        
+        if not mapping_rows:
+            mapping_rows = "<tr><td colspan=4>No mappings configured</td></tr>"
+        
+        mapping_modals += f"""
+        <div class="modal fade" id="mapCalendarModal{s['id']}" tabindex="-1">
+            <div class="modal-dialog modal-lg">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h5 class="modal-title">Field Mappings – {s['name']}</h5>
+                        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                    </div>
+                    <div class="modal-body">
+                        <p class="text-muted">Map JSON fields from the API to internal fields. All fields are required.</p>
+                        
+                        <div class="card mb-3">
+                            <div class="card-body">
+                                <form method="POST" action="/admin/set-calendar-mapping">
+                                    <input type="hidden" name="source_id" value="{s['id']}">
+                                    <div class="row g-3">
+                                        <div class="col-md-3">
+                                            <label class="form-label">Internal Field</label>
+                                            <select name="internal_field" class="form-select form-select-sm" required>
+                                                <option value="">Select...</option>
+                                                <option value="event_id">event_id</option>
+                                                <option value="title">title</option>
+                                                <option value="full_url">full_url</option>
+                                                <option value="start_date_ms">start_date_ms</option>
+                                                <option value="end_date_ms">end_date_ms</option>
+                                            </select>
+                                        </div>
+                                        <div class="col-md-4">
+                                            <label class="form-label">JSON Path</label>
+                                            <input type="text" name="json_path" class="form-control form-control-sm" placeholder="id, structuredContent.startDate" required>
+                                        </div>
+                                        <div class="col-md-3">
+                                            <label class="form-label">Transform</label>
+                                            <select name="transform" class="form-select form-select-sm">
+                                                <option value="identity" selected>identity (raw)</option>
+                                                <option value="str">str</option>
+                                                <option value="int">int</option>
+                                                <option value="float">float</option>
+                                                <option value="trim">trim</option>
+                                                <option value="multiply_1000">multiply_1000</option>
+                                                <option value="iso_to_ms">iso_to_ms</option>
+                                            </select>
+                                        </div>
+                                        <div class="col-md-2 align-self-end">
+                                            <button type="submit" class="btn btn-primary btn-sm w-100">Save</button>
+                                        </div>
+                                    </div>
+                                </form>
+                            </div>
+                        </div>
+                        
+                        <h6 class="mt-3">Current Mappings</h6>
+                        <table class="table table-sm table-bordered">
+                            <thead><tr><th>Field</th><th>JSON Path</th><th>Transform</th><th></th></tr></thead>
+                            <tbody>
+                                {mapping_rows}
+                            </tbody>
+                        </table>
+                        
+                        <div class="alert alert-info mt-3">
+                            <small>
+                                <strong>Preset Examples:</strong><br>
+                                Squarespace: <code>id, title, fullUrl, startDate, endDate</code><br>
+                                Eventbrite: <code>id, name, url, start_date, end_date</code><br>
+                                Generic: <code>id, title, url, start_time, end_time</code>
+                            </small>
+                        </div>
+                    </div>
+                    <div class="modal-footer">
+                        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+        """
+    
+    calendar_modal = """
+    <div class="modal fade" id="addCalendarModal" tabindex="-1">
+        <div class="modal-dialog">
+            <div class="modal-content">
+                <form method="POST" action="/admin/add-calendar">
+                    <div class="modal-header">
+                        <h5 class="modal-title">Add Calendar Source</h5>
+                        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                    </div>
+                    <div class="modal-body">
+                        <div class="mb-3">
+                            <label class="form-label">Name</label>
+                            <input type="text" name="name" class="form-control" required>
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label">Base URL</label>
+                            <input type="text" name="base_url" class="form-control" placeholder="https://thedentheatre.com" required>
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label">API Template</label>
+                            <input type="text" name="api_template" class="form-control" placeholder="/api/open/GetItemsByMonth?month={{month}}&collectionId={{collection_id}}">
+                            <small class="text-muted">Use {{month}} and {{collection_id}} as placeholders</small>
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label">Collection ID</label>
+                            <input type="text" name="collection_id" class="form-control" required>
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label">Referer Template (optional)</label>
+                            <input type="text" name="referer_template" class="form-control" placeholder="https://thedentheatre.com/calendar?view=calendar&month={{month}}">
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label">Lookahead Months</label>
+                            <input type="number" name="lookahead_months" class="form-control" value="3" min="1" max="12">
+                        </div>
+                    </div>
+                    <div class="modal-footer">
+                        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                        <button type="submit" class="btn btn-primary">Add Calendar</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+    {mapping_modals}
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    """
+    
+    html = f"""
+    <html>
+    <head>
+        <title>Calendar Sources</title>
+        <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    </head>
+    <body class="bg-light">
+        <div class="container py-4">
+            <div class="mb-3">
+                <a href="/admin" class="btn btn-outline-secondary">&larr; Back to Admin</a>
+            </div>
+            <div class="card">
+                <div class="card-header d-flex justify-content-between align-items-center">
+                    <h5>Calendar Sources</h5>
+                    <button type="button" class="btn btn-primary btn-sm" data-bs-toggle="modal" data-bs-target="#addCalendarModal">Add Calendar</button>
+                </div>
+                <div class="card-body">
+                    {calendar_form}
+                    <table class="table table-striped">
+                        <thead><tr><th>Name</th><th>Base URL</th><th>Collection ID</th><th>Months</th><th>Status</th><th>Actions</th></tr></thead>
+                        <tbody>
+{rows}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+{calendar_modal}
+    </body>
+    </html>
+    """ 
+    return html
+
+
+@app.post("/admin/add-calendar")
+async def admin_add_calendar(
+    name: str = Form(...),
+    base_url: str = Form(...),
+    api_template: str = Form(...),
+    collection_id: str = Form(...),
+    referer_template: str = Form(""),
+    lookahead_months: int = Form(3),
+    username: str = Depends(get_current_user),
+):
+    """Add a new calendar source."""
+    if not calendar_fetcher:
+        raise HTTPException(status_code=500, detail="Calendar fetcher not initialized")
+    calendar_fetcher.add_source(
+        name=name,
+        base_url=base_url,
+        api_template=api_template,
+        collection_id=collection_id,
+        referer_template=referer_template,
+        lookahead_months=lookahead_months,
+    )
+    logger.info(f"Calendar source added: {name}")
+    return RedirectResponse(url="/admin/calendars", status_code=303)
+
+
+@app.post("/admin/delete-calendar")
+async def admin_delete_calendar(
+    source_id: int = Form(...),
+    username: str = Depends(get_current_user),
+):
+    """Delete a calendar source."""
+    if not calendar_fetcher:
+        raise HTTPException(status_code=500, detail="Calendar fetcher not initialized")
+    calendar_fetcher.delete_source(source_id)
+    logger.info(f"Calendar source {source_id} deleted")
+    return RedirectResponse(url="/admin/calendars", status_code=303)
+
+
+@app.post("/admin/toggle-calendar")
+async def admin_toggle_calendar(
+    source_id: int = Form(...),
+    username: str = Depends(get_current_user),
+):
+    """Toggle a calendar source on/off."""
+    if not calendar_fetcher:
+        raise HTTPException(status_code=500, detail="Calendar fetcher not initialized")
+    source = calendar_fetcher._get_source(source_id)
+    if not source:
+        raise HTTPException(status_code=404, detail="Source not found")
+    calendar_fetcher.enable_source(source_id) if not source["enabled"] else calendar_fetcher.disable_source(source_id)
+    logger.info(f"Calendar source {source_id} {'enabled' if source['enabled'] else 'disabled'}")
+    return RedirectResponse(url="/admin/calendars", status_code=303)
+
+
+@app.post("/admin/refresh-calendar")
+async def admin_refresh_calendar(
+    source_id: int = Form(...),
+    username: str = Depends(get_current_user),
+):
+    """Force refresh a calendar source."""
+    if not calendar_fetcher:
+        raise HTTPException(status_code=500, detail="Calendar fetcher not initialized")
+    await calendar_fetcher.fetch_all_lookahead(source_id)
+    logger.info(f"Calendar source {source_id} refreshed")
+    return RedirectResponse(url="/admin/calendars", status_code=303)
+@app.get("/admin/preview", response_class=HTMLResponse)
+@app.post("/admin/set-calendar-mapping")
+async def admin_set_calendar_mapping(
+    source_id: int = Form(...),
+    internal_field: str = Form(...),
+    json_path: str = Form(...),
+    transform: str = Form(default="identity"),
+    username: str = Depends(get_current_user),
+):
+    """Set or update a field mapping for a calendar source."""
+    if not calendar_fetcher:
+        raise HTTPException(status_code=500, detail="Calendar fetcher not initialized")
+    
+    # Validate required fields
+    required_fields = calendar_fetcher.get_required_fields()
+    if internal_field not in required_fields:
+        return RedirectResponse(url="/admin/calendars", status_code=303)
+    
+    # Check if source exists
+    source = calendar_fetcher._get_source(source_id)
+    if not source:
+        return RedirectResponse(url="/admin/calendars", status_code=303)
+    
+    calendar_fetcher.set_field_mapping(source_id, internal_field, json_path, transform)
+    logger.info(f"Calendar mapping updated: source {source_id}, field {internal_field} <- {json_path} ({transform})")
+    return RedirectResponse(url="/admin/calendars", status_code=303)
+
+
+@app.post("/admin/delete-calendar-field")
+async def admin_delete_calendar_field(
+    source_id: int = Form(...),
+    internal_field: str = Form(...),
+    username: str = Depends(get_current_user),
+):
+    """Delete a field mapping for a calendar source."""
+    if not calendar_fetcher:
+        raise HTTPException(status_code=500, detail="Calendar fetcher not initialized")
+    
+    # Check if source exists
+    source = calendar_fetcher._get_source(source_id)
+    if not source:
+        return RedirectResponse(url="/admin/calendars", status_code=303)
+    
+    calendar_fetcher.delete_field_mapping(source_id, internal_field)
+    logger.info(f"Calendar mapping deleted: source {source_id}, field {internal_field}")
+    return RedirectResponse(url="/admin/calendars", status_code=303)
+
 
 @app.get("/admin/preview", response_class=HTMLResponse)
 async def admin_preview(guid: str, username: str = Depends(get_current_user)):
