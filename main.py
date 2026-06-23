@@ -488,7 +488,7 @@ async def hydrate_and_save(article):
     guid = article['guid']
     url = article['link']
     try:
-        title, content = await hydrate_article(url)
+        title, content = await asyncio.wait_for(hydrate_article(url), timeout=60.0)
         # Use extracted title if available and current title is just the URL or placeholder
         final_title = title if title and (not article['title'] or article['title'] == url or article['title'] == "Manual Link") else article['title']
         
@@ -631,8 +631,13 @@ async def hydrate_article(url: str) -> Tuple[Optional[str], Optional[str]]:
                 await new Promise((resolve) => {
                     let totalHeight = 0; let distance = 200;
                     let timer = setInterval(() => {
-                        window.scrollBy(0, distance); totalHeight += distance;
-                        if(totalHeight >= document.body.scrollHeight || totalHeight > 4000){
+                        try {
+                            window.scrollBy(0, distance); totalHeight += distance;
+                            let scrollHeight = document.body ? document.body.scrollHeight : 0;
+                            if(totalHeight >= scrollHeight || totalHeight > 4000){
+                                clearInterval(timer); resolve();
+                            }
+                        } catch (e) {
                             clearInterval(timer); resolve();
                         }
                     }, 100);
