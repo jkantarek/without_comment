@@ -488,7 +488,7 @@ async def hydrate_and_save(article):
     guid = article['guid']
     url = article['link']
     try:
-        title, content = await asyncio.wait_for(hydrate_article(url), timeout=60.0)
+        title, content = await asyncio.wait_for(hydrate_article(url), timeout=180.0)
         # Use extracted title if available and current title is just the URL or placeholder
         final_title = title if title and (not article['title'] or article['title'] == url or article['title'] == "Manual Link") else article['title']
         
@@ -518,10 +518,10 @@ async def hydrate_and_save(article):
         archive_domains = cache.get_archive_domains()
         retry_count = article.get('retry_count', 0)
         if archive_manager.should_archive(url, archive_domains) and retry_count < ARCHIVE_MAX_RETRIES:
-            logger.error(f"ARCHIVE RETRY {retry_count + 1}/{ARCHIVE_MAX_RETRIES}: Exception for '{article['title']}' ({guid}): {e}")
+            logger.error(f"ARCHIVE RETRY {retry_count + 1}/{ARCHIVE_MAX_RETRIES}: Exception for '{article['title']}' ({guid}): {type(e).__name__}: {e}")
             cache.mark_as_retrying(guid)
         else:
-            logger.error(f"CRITICAL FAILURE: Error during hydration task for '{article['title']}' ({guid}): {e}")
+            logger.exception(f"CRITICAL FAILURE: Error during hydration task for '{article['title']}' ({guid}): {type(e).__name__}: {e}")
             cache.save_article(guid, url, article['title'], 
                              article['description'], 
                              article['pub_date'], 
@@ -621,7 +621,7 @@ async def hydrate_article(url: str) -> Tuple[Optional[str], Optional[str]]:
             handler = REPO_HANDLERS.get(domain)
             page = await browser_instance.new_page()
             await page.set_extra_http_headers({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0"})
-            await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            await page.goto(url, wait_until="domcontentloaded", timeout=180000)
             
             # Use the page title as a fallback
             page_title = await page.title()
