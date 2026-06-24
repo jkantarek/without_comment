@@ -207,6 +207,9 @@ class FeedCache:
     def save_article(self, guid, link, title, description, pub_date, source_title=None, feed_url=None, hydrated=0):
         try:
             with self._get_conn() as conn:
+                cursor = conn.execute("SELECT 1 FROM articles WHERE guid = ?", (guid,))
+                is_new = cursor.fetchone() is None
+                
                 conn.execute("""
                     INSERT INTO articles (guid, link, title, description, source_title, feed_url, pub_date, hydrated)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -229,8 +232,10 @@ class FeedCache:
                         END
                 """, (guid, link, title, description, source_title, feed_url, pub_date, hydrated))
                 conn.commit()
+                return is_new
         except Exception as e:
             logger.error(f"DB Error: {e}")
+            return False
 
     def backfill_feed_urls(self):
         try:
@@ -258,9 +263,14 @@ class FeedCache:
     def mark_as_retrying(self, guid):
         with self._get_conn() as conn:
             conn.execute(
-                "UPDATE articles SET hydrated=3, retry_count=retry_count+1 WHERE guid=?",
+                "UPDATE articles SET hydrated=4, retry_count=retry_count+1 WHERE guid=?",
                 (guid,)
             )
+            conn.commit()
+
+    def promote_deferred_retries(self):
+        with self._get_conn() as conn:
+            conn.execute("UPDATE articles SET hydrated=3 WHERE hydrated=4")
             conn.commit()
 
     def get_unhydrated_count(self):
@@ -276,7 +286,7 @@ class FeedCache:
                     SUM(CASE WHEN hydrated = 1 THEN 1 ELSE 0 END) as hydrated,
                     SUM(CASE WHEN hydrated = 0 THEN 1 ELSE 0 END) as pending,
                     SUM(CASE WHEN hydrated = 2 THEN 1 ELSE 0 END) as failed,
-                    SUM(CASE WHEN hydrated = 3 THEN 1 ELSE 0 END) as retrying
+                    SUM(CASE WHEN hydrated IN (3, 4) THEN 1 ELSE 0 END) as retrying
                 FROM articles
             """)
             row = cursor.fetchone()
@@ -441,8 +451,9 @@ async def expand_libhunt_newsletter(newsletter_url, client, feed_title, feed_url
                 continue
             
             # Use the story link as GUID to avoid duplicates across newsletters
-            cache.save_article(link, link, title, description, pub_dt, source_title=f"{feed_title}", feed_url=feed_url, hydrated=0)
-            expanded_count += 1
+            is_new = cache.save_article(link, link, title, description, pub_dt, source_title=f"{feed_title}", feed_url=feed_url, hydrated=0)
+            if is_new:
+                expanded_count += 1
         return expanded_count
     except Exception as e:
         logger.error(f"Error expanding libhunt newsletter {newsletter_url}: {e}")
@@ -470,13 +481,13 @@ async def refresh_feed(f, global_ignores):
                 # Special handling for LibHunt newsletter feeds to break out individual stories
                 if "libhunt.com" in url.lower() and "/newsletter/" in link.lower() and not link.lower().endswith("/feed"):
                     expanded = await expand_libhunt_newsletter(link, client, feed_title, url, combined_ignores, pub_dt)
-                    if expanded > 0:
-                        count += expanded
-                        continue # Skip saving the main newsletter edition entry
+                    count += expanded
+                    continue # Skip saving the main newsletter edition entry
 
                 # save_article now handles ON CONFLICT to backfill feed_url/source_title safely
-                cache.save_article(guid, link, title, getattr(entry, 'description', ''), pub_dt, source_title=feed_title, feed_url=url, hydrated=0)
-                count += 1
+                is_new = cache.save_article(guid, link, title, getattr(entry, 'description', ''), pub_dt, source_title=feed_title, feed_url=url, hydrated=0)
+                if is_new:
+                    count += 1
             if count > 0:
                 logger.info(f"Added {count} new articles from {feed_title}")
     except Exception as e:
@@ -503,8 +514,12 @@ async def hydrate_and_save(article):
         else:
             archive_domains = cache.get_archive_domains()
             retry_count = article.get('retry_count', 0)
-            if archive_manager.should_archive(url, archive_domains) and retry_count < ARCHIVE_MAX_RETRIES:
-                logger.warning(f"ARCHIVE RETRY {retry_count + 1}/{ARCHIVE_MAX_RETRIES}: Not ready yet for '{article['title']}' ({guid}).")
+            is_archive = archive_manager.should_archive(url, archive_domains)
+            max_retries = ARCHIVE_MAX_RETRIES if is_archive else 1
+            
+            if retry_count < max_retries:
+                prefix = "ARCHIVE RETRY" if is_archive else "STANDARD RETRY"
+                logger.warning(f"{prefix} {retry_count + 1}/{max_retries}: Not ready yet for '{article['title']}' ({guid}).")
                 cache.mark_as_retrying(guid)
             else:
                 logger.warning(f"FAILURE: Could not extract content for '{article['title']}' ({guid}). Marking as failed.")
@@ -517,8 +532,12 @@ async def hydrate_and_save(article):
     except Exception as e:
         archive_domains = cache.get_archive_domains()
         retry_count = article.get('retry_count', 0)
-        if archive_manager.should_archive(url, archive_domains) and retry_count < ARCHIVE_MAX_RETRIES:
-            logger.error(f"ARCHIVE RETRY {retry_count + 1}/{ARCHIVE_MAX_RETRIES}: Exception for '{article['title']}' ({guid}): {type(e).__name__}: {e}")
+        is_archive = archive_manager.should_archive(url, archive_domains)
+        max_retries = ARCHIVE_MAX_RETRIES if is_archive else 1
+        
+        if retry_count < max_retries:
+            prefix = "ARCHIVE RETRY" if is_archive else "STANDARD RETRY"
+            logger.error(f"{prefix} {retry_count + 1}/{max_retries}: Exception for '{article['title']}' ({guid}): {type(e).__name__}: {e}")
             cache.mark_as_retrying(guid)
         else:
             logger.exception(f"CRITICAL FAILURE: Error during hydration task for '{article['title']}' ({guid}): {type(e).__name__}: {e}")
@@ -539,6 +558,9 @@ async def background_refresh_task():
             
             # Parallel feed refresh
             await asyncio.gather(*[refresh_feed(f, global_ignores) for f in feeds], return_exceptions=True)
+
+            # Promote items that failed in the LAST cycle to be retried in THIS cycle
+            cache.promote_deferred_retries()
 
             # Keep hydrating in batches until the queue is cleared
             while True:
