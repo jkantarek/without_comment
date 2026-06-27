@@ -11,6 +11,7 @@ A probably garbage, AI vibed, automated RSS aggregator. It's supposed to hydrate
   - Converts relative URLs to absolute paths.
   - Special handlers for Git repositories (GitHub, GitLab, Codeberg, Bitbucket) to extract READMEs.
 - **SQLite Managed**: Feeds, global ignore lists, and cached articles are all stored in a persistent SQLite database.
+- **15-Day Retention**: Articles older than 15 days are automatically purged to conserve storage.
 - **Admin Dashboard**: A password-protected UI (`/admin`) to manage feeds, bulk import URLs, and configure domain-based filters.
 - **Deployment Ready**: Optimized for Docker and Dokploy with `uv` for fast dependency management.
 
@@ -25,6 +26,7 @@ Required for management:
 Optional for feed protection:
 - `FEED_USER`: Username to protect the `/rss` endpoint.
 - `FEED_PASS`: Password to protect the `/rss` endpoint.
+- `ARTICLE_RETENTION_DAYS`: Override the default 15-day article retention window.
 
 ### Running Locally
 

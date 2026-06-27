@@ -77,6 +77,13 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 DB_PATH = os.environ.get("DB_PATH", "cache.db")
+def _retention_days_from_env():
+    try:
+        return int(os.environ.get("ARTICLE_RETENTION_DAYS", "15"))
+    except ValueError:
+        logger.warning("Invalid ARTICLE_RETENTION_DAYS; defaulting to 15 days.")
+        return 15
+ARTICLE_RETENTION_DAYS = _retention_days_from_env()
 security = HTTPBasic()
 
 # Auth Config
@@ -197,7 +204,35 @@ class FeedCache:
                     domain TEXT PRIMARY KEY
                 )
             """)
+            conn.execute("""
+                UPDATE articles
+                SET created_at = datetime(created_at, 'unixepoch')
+                WHERE typeof(created_at) = 'integer'
+            """)  # Normalize any legacy integer timestamps into ISO strings
             conn.commit()
+
+    def purge_old_articles(self, days: Optional[int] = None):
+        """Remove articles older than the configured retention window."""
+        if days is None:
+            days = ARTICLE_RETENTION_DAYS
+        if days <= 0:
+            raise ValueError(f"Retention days must be greater than 0, got {days}")
+        try:
+            cutoff_dt = datetime.datetime.now(tz=datetime.timezone.utc) - datetime.timedelta(days=days)
+            cutoff = int(cutoff_dt.timestamp())
+            with self._get_conn() as conn:
+                # created_at is stored as an ISO datetime string; convert to epoch seconds for comparison
+                deleted = conn.execute(
+                    "DELETE FROM articles WHERE CAST(strftime('%s', created_at) AS INTEGER) < ?",
+                    (cutoff,)
+                ).rowcount
+                conn.commit()
+                if deleted:
+                    logger.info(f"Purged {deleted} articles older than {days} days")
+        except sqlite3.Error as e:
+            logger.error(f"Database purge error for {days}-day retention: {e}")
+        except Exception as e:
+            logger.error(f"Unexpected purge error for {days}-day retention: {e}")
 
     def get_article(self, guid):
         with self._get_conn() as conn:
@@ -553,6 +588,7 @@ async def background_refresh_task():
     while True:
         try:
             logger.info("Starting background refresh cycle...")
+            cache.purge_old_articles()
             feeds = cache.get_feeds()
             global_ignores = cache.get_global_ignores()
             
