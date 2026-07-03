@@ -1020,7 +1020,11 @@ async def admin_page(tab: str = "management", username: str = Depends(get_curren
             <div class="card-footer text-muted small d-flex gap-2 align-items-center">
                 <a href="{item['link']}" target="_blank" class="btn btn-sm btn-outline-secondary">View Original URL</a>
                 <a href="/admin/preview?guid={item['guid']}" target="_blank" class="btn btn-sm btn-outline-info">Full Preview</a>
-                {f'<a href="/s/{item["share_alias"]}" target="_blank" class="btn btn-sm btn-success">Public Share Link</a>' if item.get('share_alias') else ''}
+                {
+                    f'<a href="/s/{item["share_alias"]}" target="_blank" class="btn btn-sm btn-success">Public Share Link</a>' 
+                    if item.get('share_alias') else 
+                    f'<form action="/admin/generate-share-link" method="post" style="margin:0;"><input type="hidden" name="guid" value="{item["guid"]}"><input type="hidden" name="redirect_to" value="/admin?tab=hydrated"><button type="submit" class="btn btn-sm btn-outline-success">Generate Share Link</button></form>'
+                }
             </div>
         </div>
     """ for item in hydrated_items])
@@ -1296,6 +1300,21 @@ async def admin_retry_all_failed(username: str = Depends(get_current_user)):
         conn.commit()
     return RedirectResponse(url="/admin?tab=failed", status_code=303)
 
+@app.post("/admin/generate-share-link")
+async def admin_generate_share_link(guid: str = Form(...), redirect_to: str = Form("/admin?tab=hydrated"), username: str = Depends(get_current_user)):
+    art = cache.get_article(guid)
+    if not art:
+        raise HTTPException(status_code=404, detail="Article not found")
+        
+    cache.get_or_create_share_link(
+        guid=guid,
+        url=art[1],
+        feed_url=art[5],
+        title=art[2],
+        pub_date=art[6]
+    )
+    return RedirectResponse(url=redirect_to, status_code=303)
+
 @app.post("/admin/force-refresh")
 async def admin_force_refresh(username: str = Depends(get_current_user)):
     global refresh_task
@@ -1326,7 +1345,16 @@ async def admin_preview(guid: str, username: str = Depends(get_current_user)):
     content = art[3]
     link = art[1]
     
-    share_btn = f'<a href="/s/{alias}" class="btn btn-outline-success" target="_blank">Public Share Link</a>' if alias else ''
+    if alias:
+        share_btn = f'<a href="/s/{alias}" class="btn btn-outline-success" target="_blank">Public Share Link</a>'
+    else:
+        share_btn = f"""
+            <form action="/admin/generate-share-link" method="post" style="display:inline; margin:0;">
+                <input type="hidden" name="guid" value="{guid}">
+                <input type="hidden" name="redirect_to" value="/admin/preview?guid={guid}">
+                <button type="submit" class="btn btn-outline-success">Generate Share Link</button>
+            </form>
+        """
     
     html = f"""
     <!DOCTYPE html>
