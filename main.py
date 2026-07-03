@@ -321,6 +321,29 @@ class FeedCache:
             
             import string, random, re
             from urllib.parse import urlparse
+            
+            base64_chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+            emojis = []
+            ranges = [
+                (0x1F300, 0x1F5FF), (0x1F600, 0x1F64F), (0x1F680, 0x1F6FF),
+                (0x1F900, 0x1F9FF), (0x2600, 0x26FF), (0x2700, 0x27BF)
+            ]
+            for start, end in ranges:
+                for i in range(start, end + 1):
+                    emojis.append(chr(i))
+            keyspace = base64_chars + "".join(emojis)
+
+            def encode_url_safe(data_str):
+                if not data_str: return ""
+                num = int.from_bytes(str(data_str).encode('utf-8'), 'big')
+                if num == 0: return keyspace[0]
+                base = len(keyspace)
+                res = []
+                while num > 0:
+                    res.append(keyspace[num % base])
+                    num //= base
+                return "".join(reversed(res))
+
             def slugify(text):
                 text = str(text or "")
                 text = re.sub(r'[^\w\s-]', '', text).strip().lower()
@@ -333,7 +356,9 @@ class FeedCache:
             
             while True:
                 random_str = ''.join(random.choices(string.ascii_lowercase + string.digits, k=4))
-                alias = f"{target_domain}-{source_domain}-{story_id}-{date_str}-{random_str}"
+                items = [target_domain, source_domain, story_id, date_str, random_str]
+                alias = "-".join(encode_url_safe(i) for i in items)
+                
                 cursor = conn.execute("SELECT 1 FROM share_links WHERE alias=?", (alias,))
                 if not cursor.fetchone():
                     conn.execute("INSERT INTO share_links (alias, guid) VALUES (?, ?)", (alias, guid))
