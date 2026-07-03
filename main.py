@@ -645,6 +645,17 @@ async def hydrate_article(url: str) -> Tuple[Optional[str], Optional[str]]:
             await page.set_extra_http_headers({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0"})
             await page.goto(url, wait_until="domcontentloaded", timeout=180000)
             
+            if domain in ["archive.ph", "archive.is", "archive.today", "archive.md", "archive.li", "archive.vn", "archive.fo"]:
+                logger.info("On archive search page, looking for newest article link...")
+                try:
+                    await page.wait_for_selector('.TEXT-BLOCK a', timeout=15000)
+                    newest_href = await page.evaluate("document.querySelector('.TEXT-BLOCK a').href")
+                    if newest_href:
+                        logger.info(f"Clicking newest archive snapshot: {newest_href}")
+                        await page.goto(newest_href, wait_until="domcontentloaded", timeout=60000)
+                except Exception as e:
+                    logger.warning(f"Could not find or navigate to newest article link on archive page: {e}")
+
             # Use the page title as a fallback
             page_title = await page.title()
             
