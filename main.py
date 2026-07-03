@@ -278,6 +278,16 @@ class FeedCache:
             cursor = conn.execute("SELECT COUNT(*) FROM articles WHERE hydrated IN (0, 3)")
             return cursor.fetchone()[0]
 
+    def get_failed_articles(self, limit=100):
+        with self._get_conn() as conn:
+            cursor = conn.execute("SELECT guid, title, link, feed_url, pub_date FROM articles WHERE hydrated=2 ORDER BY pub_date DESC LIMIT ?", (limit,))
+            return [{"guid": r[0], "title": r[1], "link": r[2], "feed_url": r[3], "pub_date": r[4]} for r in cursor.fetchall()]
+
+    def get_hydrated_articles(self, limit=50):
+        with self._get_conn() as conn:
+            cursor = conn.execute("SELECT guid, title, link, feed_url, pub_date, description FROM articles WHERE hydrated=1 ORDER BY pub_date DESC LIMIT ?", (limit,))
+            return [{"guid": r[0], "title": r[1], "link": r[2], "feed_url": r[3], "pub_date": r[4], "content_html": r[5]} for r in cursor.fetchall()]
+
     def get_stats(self):
         with self._get_conn() as conn:
             cursor = conn.execute("""
@@ -801,14 +811,21 @@ async def admin_page(tab: str = "management", username: str = Depends(get_curren
     archive_domains = cache.get_archive_domains()
     stats = cache.get_stats()
     metrics = cache.get_feed_item_metrics()
+    failed_items = cache.get_failed_articles()
+    hydrated_items = cache.get_hydrated_articles()
     
     refresh_str = last_refresh_time.strftime("%Y-%m-%d %H:%M:%S") if last_refresh_time else "Never"
     
     # Tab activation logic
     mgmt_active = "active" if tab == "management" else ""
     metrics_active = "active" if tab == "metrics" else ""
+    failed_active = "active" if tab == "failed" else ""
+    hydrated_active = "active" if tab == "hydrated" else ""
+    
     mgmt_show = "show active" if tab == "management" else ""
     metrics_show = "show active" if tab == "metrics" else ""
+    failed_show = "show active" if tab == "failed" else ""
+    hydrated_show = "show active" if tab == "hydrated" else ""
 
     stats_html = f"""
     <div class="row mb-4">
@@ -904,6 +921,38 @@ async def admin_page(tab: str = "management", username: str = Depends(get_curren
         </tr>
     """ for m in metrics])
 
+    failed_rows = "".join([f"""
+        <tr>
+            <td>
+                <strong>{item['title']}</strong><br>
+                <a href="{item['link']}" target="_blank" class="text-muted small">{item['link']}</a>
+            </td>
+            <td><small>{item['feed_url']}</small></td>
+            <td>
+                <form action="/admin/retry-item" method="post" style="margin:0">
+                    <input type="hidden" name="guid" value="{item['guid']}">
+                    <button type="submit" class="btn btn-sm btn-outline-warning">Retry</button>
+                </form>
+            </td>
+        </tr>
+    """ for item in failed_items])
+
+    hydrated_html = "".join([f"""
+        <div class="card mb-4 shadow-sm">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <h5 class="mb-0"><a href="{item['link']}" target="_blank" style="text-decoration:none; color:inherit;">{item['title']}</a></h5>
+                <small class="text-muted">{item['feed_url']}</small>
+            </div>
+            <div class="card-body" style="max-height: 400px; overflow-y: auto;">
+                {item['content_html']}
+            </div>
+            <div class="card-footer text-muted small">
+                <a href="{item['link']}" target="_blank">View Original URL ({item['link']})</a> | 
+                <a href="/admin/preview?guid={item['guid']}" target="_blank">Full Preview</a>
+            </div>
+        </div>
+    """ for item in hydrated_items])
+
     html = f"""
     <!DOCTYPE html>
     <html>
@@ -929,6 +978,12 @@ async def admin_page(tab: str = "management", username: str = Depends(get_curren
                 </li>
                 <li class="nav-item">
                     <a class="nav-link {metrics_active}" href="/admin?tab=metrics">Feed Item Metrics</a>
+                </li>
+                <li class="nav-item">
+                    <a class="nav-link {failed_active}" href="/admin?tab=failed">Failed Items ({len(failed_items)})</a>
+                </li>
+                <li class="nav-item">
+                    <a class="nav-link {hydrated_active}" href="/admin?tab=hydrated">Hydrated Items</a>
                 </li>
             </ul>
 
@@ -1050,6 +1105,37 @@ async def admin_page(tab: str = "management", username: str = Depends(get_curren
                         </div>
                     </div>
                 </div>
+
+                <div class="tab-pane fade {failed_show}" id="failed">
+                    <div class="card shadow-sm">
+                        <div class="card-header bg-danger text-white d-flex justify-content-between align-items-center">
+                            <span class="mb-0">Failed Items</span>
+                            <form action="/admin/retry-all-failed" method="post" style="margin:0">
+                                <button type="submit" class="btn btn-sm btn-light text-danger">Retry All Failed</button>
+                            </form>
+                        </div>
+                        <div class="card-body p-0">
+                            <table class="table table-striped table-hover mb-0">
+                                <thead class="table-dark">
+                                    <tr>
+                                        <th>Title / URL</th>
+                                        <th>Feed</th>
+                                        <th>Action</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {failed_rows}
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="tab-pane fade {hydrated_show}" id="hydrated">
+                    <div class="container-fluid p-0">
+                        {hydrated_html}
+                    </div>
+                </div>
             </div>
         </div>
     </body>
@@ -1103,6 +1189,20 @@ async def admin_add_archive_domain(domain: str = Form(...), username: str = Depe
 async def admin_delete_archive_domain(domain: str = Form(...), username: str = Depends(get_current_user)):
     cache.delete_archive_domain(domain)
     return RedirectResponse(url="/admin", status_code=303)
+
+@app.post("/admin/retry-item")
+async def admin_retry_item(guid: str = Form(...), username: str = Depends(get_current_user)):
+    with cache._get_conn() as conn:
+        conn.execute("UPDATE articles SET hydrated=0, retry_count=0 WHERE guid=?", (guid,))
+        conn.commit()
+    return RedirectResponse(url="/admin?tab=failed", status_code=303)
+
+@app.post("/admin/retry-all-failed")
+async def admin_retry_all_failed(username: str = Depends(get_current_user)):
+    with cache._get_conn() as conn:
+        conn.execute("UPDATE articles SET hydrated=0, retry_count=0 WHERE hydrated=2")
+        conn.commit()
+    return RedirectResponse(url="/admin?tab=failed", status_code=303)
 
 @app.post("/admin/force-refresh")
 async def admin_force_refresh(username: str = Depends(get_current_user)):
