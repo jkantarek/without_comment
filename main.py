@@ -197,6 +197,15 @@ class FeedCache:
                     domain TEXT PRIMARY KEY
                 )
             """)
+            # Share Links table
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS share_links (
+                    alias TEXT PRIMARY KEY,
+                    guid TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY(guid) REFERENCES articles(guid)
+                )
+            """)
             conn.commit()
 
     def get_article(self, guid):
@@ -280,13 +289,46 @@ class FeedCache:
 
     def get_failed_articles(self, limit=100):
         with self._get_conn() as conn:
-            cursor = conn.execute("SELECT guid, title, link, feed_url, pub_date FROM articles WHERE hydrated=2 ORDER BY pub_date DESC LIMIT ?", (limit,))
+            cursor = conn.execute("SELECT guid, title, link, feed_url, pub_date FROM articles WHERE hydrated IN (0, 2, 3, 4) ORDER BY pub_date DESC LIMIT ?", (limit,))
             return [{"guid": r[0], "title": r[1], "link": r[2], "feed_url": r[3], "pub_date": r[4]} for r in cursor.fetchall()]
 
     def get_hydrated_articles(self, limit=50):
         with self._get_conn() as conn:
-            cursor = conn.execute("SELECT guid, title, link, feed_url, pub_date, description FROM articles WHERE hydrated=1 ORDER BY pub_date DESC LIMIT ?", (limit,))
-            return [{"guid": r[0], "title": r[1], "link": r[2], "feed_url": r[3], "pub_date": r[4], "content_html": r[5]} for r in cursor.fetchall()]
+            cursor = conn.execute("""
+                SELECT a.guid, a.title, a.link, a.feed_url, a.pub_date, a.description, s.alias 
+                FROM articles a 
+                LEFT JOIN share_links s ON a.guid = s.guid 
+                WHERE a.hydrated=1 ORDER BY a.pub_date DESC LIMIT ?
+            """, (limit,))
+            return [{"guid": r[0], "title": r[1], "link": r[2], "feed_url": r[3], "pub_date": r[4], "content_html": r[5], "share_alias": r[6]} for r in cursor.fetchall()]
+
+    def get_or_create_share_link(self, guid, url, feed_url, title, pub_date):
+        with self._get_conn() as conn:
+            cursor = conn.execute("SELECT alias FROM share_links WHERE guid=?", (guid,))
+            row = cursor.fetchone()
+            if row:
+                return row[0]
+            
+            import string, random, re
+            from urllib.parse import urlparse
+            def slugify(text):
+                text = str(text or "")
+                text = re.sub(r'[^\w\s-]', '', text).strip().lower()
+                return re.sub(r'[-\s]+', '-', text)[:50]
+
+            target_domain = urlparse(url).netloc.lower().replace("www.", "") if url else "unknown"
+            source_domain = urlparse(feed_url).netloc.lower().replace("www.", "") if feed_url else "unknown"
+            story_id = slugify(title) or "article"
+            date_str = str(pub_date).split('T')[0].split(' ')[0].replace("-", "") if pub_date else "nodate"
+            
+            while True:
+                random_str = ''.join(random.choices(string.ascii_lowercase + string.digits, k=4))
+                alias = f"{target_domain}-{source_domain}-{story_id}-{date_str}-{random_str}"
+                cursor = conn.execute("SELECT 1 FROM share_links WHERE alias=?", (alias,))
+                if not cursor.fetchone():
+                    conn.execute("INSERT INTO share_links (alias, guid) VALUES (?, ?)", (alias, guid))
+                    conn.commit()
+                    return alias
 
     def get_stats(self):
         with self._get_conn() as conn:
@@ -850,7 +892,7 @@ async def admin_page(tab: str = "management", username: str = Depends(get_curren
         <div class="col">
             <div class="card bg-info text-white text-center p-3 shadow-sm">
                 <div class="h4 mb-0">{stats['retrying']}</div>
-                <small>Retrying (archive.is)</small>
+                <small>Retrying (archive.ph)</small>
             </div>
         </div>
         <div class="col">
@@ -946,9 +988,10 @@ async def admin_page(tab: str = "management", username: str = Depends(get_curren
             <div class="card-body" style="max-height: 400px; overflow-y: auto;">
                 {item['content_html']}
             </div>
-            <div class="card-footer text-muted small">
-                <a href="{item['link']}" target="_blank">View Original URL ({item['link']})</a> | 
-                <a href="/admin/preview?guid={item['guid']}" target="_blank">Full Preview</a>
+            <div class="card-footer text-muted small d-flex gap-2 align-items-center">
+                <a href="{item['link']}" target="_blank" class="btn btn-sm btn-outline-secondary">View Original URL</a>
+                <a href="/admin/preview?guid={item['guid']}" target="_blank" class="btn btn-sm btn-outline-info">Full Preview</a>
+                {f'<a href="/s/{item["share_alias"]}" target="_blank" class="btn btn-sm btn-success">Public Share Link</a>' if item.get('share_alias') else ''}
             </div>
         </div>
     """ for item in hydrated_items])
@@ -1247,6 +1290,50 @@ async def admin_preview(guid: str, username: str = Depends(get_current_user)):
                     <h1 class="mb-4">{title}</h1>
                     <hr>
                     <div class="article-content">
+                        {content}
+                    </div>
+                </div>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+    return html
+
+@app.get("/s/{alias}", response_class=HTMLResponse)
+async def public_share_link(alias: str):
+    with cache._get_conn() as conn:
+        cursor = conn.execute("SELECT guid FROM share_links WHERE alias=?", (alias,))
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Share link not found")
+        guid = row[0]
+        
+    art = cache.get_article(guid)
+    if not art:
+        raise HTTPException(status_code=404, detail="Article not found")
+        
+    title = art[2]
+    content = art[3]
+    link = art[1]
+    
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>{title}</title>
+        <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    </head>
+    <body class="bg-light">
+        <div class="container py-5">
+            <div class="mb-4 text-center">
+                <a href="{link}" class="btn btn-primary" target="_blank">View Original Source</a>
+            </div>
+            <div class="card shadow-sm">
+                <div class="card-body">
+                    <h1 class="mb-4 text-center">{title}</h1>
+                    <hr>
+                    <div class="article-content" style="max-width: 800px; margin: 0 auto;">
                         {content}
                     </div>
                 </div>
