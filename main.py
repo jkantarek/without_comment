@@ -266,7 +266,12 @@ class FeedCache:
     def get_latest_articles(self, limit=500):
         with self._get_conn() as conn:
             conn.row_factory = sqlite3.Row
-            cursor = conn.execute("SELECT * FROM articles WHERE hydrated = 1 ORDER BY pub_date DESC LIMIT ?", (limit,))
+            cursor = conn.execute("""
+                SELECT a.*, s.alias as share_alias 
+                FROM articles a 
+                LEFT JOIN share_links s ON a.guid = s.guid 
+                WHERE a.hydrated = 1 ORDER BY a.pub_date DESC LIMIT ?
+            """, (limit,))
             return [dict(row) for row in cursor.fetchall()]
 
     def mark_as_retrying(self, guid):
@@ -289,8 +294,13 @@ class FeedCache:
 
     def get_failed_articles(self, limit=100):
         with self._get_conn() as conn:
-            cursor = conn.execute("SELECT guid, title, link, feed_url, pub_date FROM articles WHERE hydrated IN (0, 2, 3, 4) ORDER BY pub_date DESC LIMIT ?", (limit,))
+            cursor = conn.execute("SELECT guid, title, link, feed_url, pub_date FROM articles WHERE hydrated=2 ORDER BY pub_date DESC LIMIT ?", (limit,))
             return [{"guid": r[0], "title": r[1], "link": r[2], "feed_url": r[3], "pub_date": r[4]} for r in cursor.fetchall()]
+
+    def get_queue_articles(self, limit=100):
+        with self._get_conn() as conn:
+            cursor = conn.execute("SELECT guid, title, link, feed_url, pub_date, hydrated FROM articles WHERE hydrated IN (0, 3, 4) ORDER BY pub_date DESC LIMIT ?", (limit,))
+            return [{"guid": r[0], "title": r[1], "link": r[2], "feed_url": r[3], "pub_date": r[4], "status": r[5]} for r in cursor.fetchall()]
 
     def get_hydrated_articles(self, limit=50):
         with self._get_conn() as conn:
@@ -813,6 +823,12 @@ async def get_rss(request: Request, username: Optional[str] = Depends(get_feed_u
         source = art.get('source_title') or "Unknown Source"
         creator_string = f"{domain} via {source}"
 
+        desc = art.get('description', '')
+        alias = art.get('share_alias')
+        if alias:
+            share_html = f'<p style="margin-bottom: 20px;"><a href="{base_url}/s/{alias}" style="display:inline-block;padding:10px 15px;background:#007bff;color:#fff;text-decoration:none;border-radius:5px;">Share Article</a></p><hr>'
+            desc = share_html + desc
+
         item = rfeed.Item(
             title=art.get('title', 'No Title'), 
             link=link, 
@@ -820,7 +836,7 @@ async def get_rss(request: Request, username: Optional[str] = Depends(get_feed_u
             # to prevent rfeed from escaping the HTML content.
             extensions=[
                 DCCreator(creator_string),
-                CDATA(art.get('description', ''))
+                CDATA(desc)
             ],
             guid=rfeed.Guid(art.get('guid', art.get('link', ''))), 
             pubDate=datetime.datetime.fromisoformat(art['pub_date'])
@@ -854,6 +870,7 @@ async def admin_page(tab: str = "management", username: str = Depends(get_curren
     stats = cache.get_stats()
     metrics = cache.get_feed_item_metrics()
     failed_items = cache.get_failed_articles()
+    queue_items = cache.get_queue_articles()
     hydrated_items = cache.get_hydrated_articles()
     
     refresh_str = last_refresh_time.strftime("%Y-%m-%d %H:%M:%S") if last_refresh_time else "Never"
@@ -963,6 +980,18 @@ async def admin_page(tab: str = "management", username: str = Depends(get_curren
         </tr>
     """ for m in metrics])
 
+    status_map = {0: "Pending", 3: "Retrying", 4: "Deferred Retry"}
+    queue_rows = "".join([f"""
+        <tr>
+            <td>
+                <strong>{item['title']}</strong><br>
+                <a href="{item['link']}" target="_blank" class="text-muted small">{item['link']}</a>
+            </td>
+            <td><small>{item['feed_url']}</small></td>
+            <td><span class="badge bg-secondary">{status_map.get(item['status'], 'Unknown')}</span></td>
+        </tr>
+    """ for item in queue_items])
+
     failed_rows = "".join([f"""
         <tr>
             <td>
@@ -1023,7 +1052,7 @@ async def admin_page(tab: str = "management", username: str = Depends(get_curren
                     <a class="nav-link {metrics_active}" href="/admin?tab=metrics">Feed Item Metrics</a>
                 </li>
                 <li class="nav-item">
-                    <a class="nav-link {failed_active}" href="/admin?tab=failed">Failed Items ({len(failed_items)})</a>
+                    <a class="nav-link {failed_active}" href="/admin?tab=failed">Queue / Failed ({len(failed_items) + len(queue_items)})</a>
                 </li>
                 <li class="nav-item">
                     <a class="nav-link {hydrated_active}" href="/admin?tab=hydrated">Hydrated Items</a>
@@ -1150,9 +1179,29 @@ async def admin_page(tab: str = "management", username: str = Depends(get_curren
                 </div>
 
                 <div class="tab-pane fade {failed_show}" id="failed">
+                    <div class="card shadow-sm mb-4">
+                        <div class="card-header bg-secondary text-white">
+                            <span class="mb-0">Pending / Retrying Queue ({len(queue_items)})</span>
+                        </div>
+                        <div class="card-body p-0">
+                            <table class="table table-striped table-hover mb-0">
+                                <thead class="table-dark">
+                                    <tr>
+                                        <th>Title / URL</th>
+                                        <th>Feed</th>
+                                        <th>Status</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {queue_rows}
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+
                     <div class="card shadow-sm">
                         <div class="card-header bg-danger text-white d-flex justify-content-between align-items-center">
-                            <span class="mb-0">Failed Items</span>
+                            <span class="mb-0">Failed Items ({len(failed_items)})</span>
                             <form action="/admin/retry-all-failed" method="post" style="margin:0">
                                 <button type="submit" class="btn btn-sm btn-light text-danger">Retry All Failed</button>
                             </form>
@@ -1265,12 +1314,19 @@ async def admin_preview(guid: str, username: str = Depends(get_current_user)):
     art = cache.get_article(guid)
     if not art:
         raise HTTPException(status_code=404, detail="Article not found")
+        
+    with cache._get_conn() as conn:
+        c = conn.execute("SELECT alias FROM share_links WHERE guid=?", (guid,))
+        row = c.fetchone()
+        alias = row[0] if row else None
     
     # SQLite row to dict or handle by index
     # guid, link, title, description, source_title, feed_url, pub_date, hydrated, created_at
     title = art[2]
     content = art[3]
     link = art[1]
+    
+    share_btn = f'<a href="/s/{alias}" class="btn btn-outline-success" target="_blank">Public Share Link</a>' if alias else ''
     
     html = f"""
     <!DOCTYPE html>
@@ -1284,6 +1340,7 @@ async def admin_preview(guid: str, username: str = Depends(get_current_user)):
             <div class="mb-4">
                 <a href="/admin" class="btn btn-outline-secondary">&larr; Back to Admin</a>
                 <a href="{link}" class="btn btn-outline-primary" target="_blank">Original Link</a>
+                {share_btn}
             </div>
             <div class="card shadow-sm">
                 <div class="card-body">
