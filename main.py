@@ -548,6 +548,17 @@ async def hydrate_and_save(article):
                              feed_url=article.get('feed_url'),
                              hydrated=2)
 
+async def ensure_browser():
+    global browser_instance
+    if not browser_instance or not browser_instance.is_connected():
+        logger.warning("Browser instance is disconnected or null. Restarting Playwright browser...")
+        try:
+            if browser_instance:
+                await browser_instance.close()
+        except Exception:
+            pass
+        browser_instance = await playwright_manager.firefox.launch(headless=True)
+
 async def background_refresh_task():
     global last_refresh_time
     while True:
@@ -574,6 +585,8 @@ async def background_refresh_task():
                 if not latest_unhydrated:
                     break
                     
+                await ensure_browser()
+                
                 # Process batch in parallel (respecting semaphore)
                 await asyncio.gather(*[hydrate_and_save(a) for a in latest_unhydrated], return_exceptions=True)
             
