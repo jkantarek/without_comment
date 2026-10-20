@@ -1,6 +1,7 @@
 services:
   aggregator:
     build: .
+    shm_size: '2gb'
     ports:
       - "8000:8000"
     volumes:

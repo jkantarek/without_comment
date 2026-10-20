@@ -18,6 +18,7 @@ import asyncio
 import feedparser
 import datetime
 import os
+import glob
 import logging
 import re
 import httpx
@@ -635,8 +636,34 @@ async def hydrate_and_save(article):
                              feed_url=article.get('feed_url'),
                              hydrated=2)
 
+FIREFOX_USER_PREFS = {
+    "app.update.enabled": False,
+    "app.update.auto": False,
+    "app.update.service.enabled": False,
+}
+
+def cleanup_firefox_locks():
+    """Remove stale lock files/symlinks left behind by crashed Firefox instances."""
+    patterns = [
+        "/ms-playwright/**/firefox/lock",
+        "/root/.cache/ms-playwright/**/firefox/lock",
+        os.path.expanduser("~/.cache/ms-playwright/**/firefox/lock"),
+    ]
+    browsers_path = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
+    if browsers_path:
+        patterns.append(os.path.join(browsers_path, "**/firefox/lock"))
+
+    for pattern in patterns:
+        for lock_path in glob.glob(pattern, recursive=True):
+            try:
+                if os.path.lexists(lock_path):
+                    os.unlink(lock_path)
+                    logger.info(f"Removed stale Firefox lock file/symlink: {lock_path}")
+            except Exception as e:
+                logger.warning(f"Failed to remove stale lock {lock_path}: {e}")
+
 async def ensure_browser():
-    global browser_instance
+    global browser_instance, playwright_manager
     if not browser_instance or not browser_instance.is_connected():
         logger.warning("Browser instance is disconnected or null. Restarting Playwright browser...")
         try:
@@ -644,7 +671,30 @@ async def ensure_browser():
                 await browser_instance.close()
         except Exception:
             pass
-        browser_instance = await playwright_manager.firefox.launch(headless=True)
+        browser_instance = None
+
+        cleanup_firefox_locks()
+
+        try:
+            if not playwright_manager:
+                playwright_manager = await async_playwright().start()
+            browser_instance = await playwright_manager.firefox.launch(
+                headless=True,
+                firefox_user_prefs=FIREFOX_USER_PREFS
+            )
+        except Exception as e:
+            logger.error(f"Failed to launch browser with existing manager: {e}. Restarting Playwright manager...")
+            try:
+                if playwright_manager:
+                    await playwright_manager.stop()
+            except Exception:
+                pass
+            cleanup_firefox_locks()
+            playwright_manager = await async_playwright().start()
+            browser_instance = await playwright_manager.firefox.launch(
+                headless=True,
+                firefox_user_prefs=FIREFOX_USER_PREFS
+            )
 
 async def background_refresh_task():
     global last_refresh_time
@@ -688,13 +738,25 @@ async def background_refresh_task():
 async def lifespan(app: FastAPI):
     global browser_instance, playwright_manager, refresh_task
     cache.backfill_feed_urls()
+    cleanup_firefox_locks()
     playwright_manager = await async_playwright().start()
-    browser_instance = await playwright_manager.firefox.launch(headless=True)
+    browser_instance = await playwright_manager.firefox.launch(
+        headless=True,
+        firefox_user_prefs=FIREFOX_USER_PREFS
+    )
     refresh_task = asyncio.create_task(background_refresh_task())
     yield
     refresh_task.cancel()
-    if browser_instance: await browser_instance.close()
-    if playwright_manager: await playwright_manager.stop()
+    if browser_instance:
+        try:
+            await browser_instance.close()
+        except Exception:
+            pass
+    if playwright_manager:
+        try:
+            await playwright_manager.stop()
+        except Exception:
+            pass
 
 app = FastAPI(lifespan=lifespan)
 
@@ -726,6 +788,7 @@ async def hydrate_article(url: str) -> Tuple[Optional[str], Optional[str]]:
         logger.warning("Hydration skipped: Browser instance not initialized.")
         return None, None
     async with hydration_semaphore:
+        context = None
         page = None
         try:
             # Check if we should use an archive.is link
@@ -741,8 +804,8 @@ async def hydrate_article(url: str) -> Tuple[Optional[str], Optional[str]]:
             logger.info(f"Hydrating: {url} (Domain: {domain})")
             
             handler = REPO_HANDLERS.get(domain)
-            page = await browser_instance.new_page()
-            await page.set_extra_http_headers({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0"})
+            context = await browser_instance.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0")
+            page = await context.new_page()
             await page.goto(url, wait_until="domcontentloaded", timeout=180000)
             
             if domain in ["archive.ph", "archive.is", "archive.today", "archive.md", "archive.li", "archive.vn", "archive.fo"]:
@@ -819,7 +882,16 @@ async def hydrate_article(url: str) -> Tuple[Optional[str], Optional[str]]:
             logger.error(f"Hydration error for {url}: {type(e).__name__}: {str(e)}")
             return None, None
         finally:
-            if page: await page.close()
+            if page:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+            if context:
+                try:
+                    await context.close()
+                except Exception:
+                    pass
 
 @app.get("/rss")
 async def get_rss(request: Request, username: Optional[str] = Depends(get_feed_user)):
